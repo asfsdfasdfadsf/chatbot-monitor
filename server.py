@@ -40,7 +40,7 @@ ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 PUBLIC_DIR = Path(__file__).resolve().parent / "public"
 
 config = {
-    "provider": "ollama",  # "ollama" | "openai" | "anthropic"
+    "provider": "ollama",  # "ollama" | "openai" | "anthropic" | "openrouter"
     "ollama_url": "http://localhost:11434",
     "default_model": "llama3:8b",
     "system_prompt": "",
@@ -49,6 +49,7 @@ config = {
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "anthropic_api_key": "",
+    "openrouter_api_key": "",
 }
 config_lock = threading.Lock()
 
@@ -515,6 +516,41 @@ def call_anthropic(question: str, model: str, system_prompt: str, temperature: f
     return answer, round(duration_ms, 1)
 
 
+def call_openrouter(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+    with config_lock:
+        api_key = config["openrouter_api_key"]
+
+    if not api_key:
+        raise ValueError("OpenRouter API key not configured — use Login with OpenRouter in Settings")
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": question})
+
+    body = {"model": model, "messages": messages}
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "http://localhost:7779",
+            "X-Title": "WaWi Chatbot Monitor",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    answer = result["choices"][0]["message"]["content"]
+    duration_ms = (time.time() - start) * 1000
+    return answer, round(duration_ms, 1)
+
+
 def call_llm(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
     """Dispatch to the configured LLM provider."""
     with config_lock:
@@ -523,6 +559,8 @@ def call_llm(question: str, model: str, system_prompt: str, temperature: float) 
         return call_openai(question, model, system_prompt, temperature)
     elif provider == "anthropic":
         return call_anthropic(question, model, system_prompt, temperature)
+    elif provider == "openrouter":
+        return call_openrouter(question, model, system_prompt, temperature)
     else:
         return call_ollama(question, model, system_prompt, temperature)
 
@@ -575,6 +613,23 @@ def list_models() -> list[dict]:
 
     elif provider == "anthropic":
         return ANTHROPIC_MODELS
+
+    elif provider == "openrouter":
+        with config_lock:
+            api_key = config["openrouter_api_key"]
+        if not api_key:
+            return OPENAI_MODELS + ANTHROPIC_MODELS  # show common models as fallback
+        try:
+            req = Request(
+                "https://openrouter.ai/api/v1/models", method="GET",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp = urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+            models = data.get("data", [])
+            return [{"name": m["id"], "size": 0} for m in models[:100]]  # cap at 100
+        except Exception:
+            return OPENAI_MODELS + ANTHROPIC_MODELS
 
     else:  # ollama
         with config_lock:
@@ -776,6 +831,11 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return self._handle_chat(session)
 
         # Admin-level routes
+        if path == "/api/openrouter/exchange":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_openrouter_exchange()
         if path == "/api/clear":
             session = self._require_auth("admin")
             if not session:
@@ -882,6 +942,44 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             delete_session(sid)
         self._send_json({"ok": True}, headers=[self._clear_cookie()])
 
+    def _handle_openrouter_exchange(self):
+        """Exchange an OpenRouter OAuth code for an API key."""
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        code = data.get("code", "").strip()
+        if not code:
+            self._send_json({"error": "code is required"}, 400)
+            return
+
+        try:
+            req_body = json.dumps({"code": code}).encode("utf-8")
+            req = Request(
+                "https://openrouter.ai/api/v1/auth/keys",
+                data=req_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urlopen(req, timeout=10)
+            result = json.loads(resp.read())
+            api_key = result.get("key", "")
+            if not api_key:
+                self._send_json({"error": "No key returned from OpenRouter"}, 502)
+                return
+
+            with config_lock:
+                config["openrouter_api_key"] = api_key
+                config["provider"] = "openrouter"
+            save_config()
+
+            self._send_json({"ok": True, "provider": "openrouter"})
+        except Exception as e:
+            self._send_json({"error": f"OpenRouter exchange failed: {e}"}, 502)
+
     # --- Event handlers ---
 
     def _handle_post_event(self):
@@ -983,10 +1081,10 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 if key in data:
                     config[key] = data[key]
             # Only update API keys if a real value is sent (not masked); allow empty to clear
-            for key in ("openai_api_key", "anthropic_api_key"):
+            for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key"):
                 if key in data and not str(data[key]).startswith("..."):
                     config[key] = data[key]
-            if "provider" in data and data["provider"] in ("ollama", "openai", "anthropic"):
+            if "provider" in data and data["provider"] in ("ollama", "openai", "anthropic", "openrouter"):
                 config["provider"] = data["provider"]
             if "bot_enabled" in data:
                 config["bot_enabled"] = bool(data["bot_enabled"])
@@ -1420,7 +1518,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         with config_lock:
             cfg = dict(config)
         # Mask API keys — show only last 4 chars
-        for key in ("openai_api_key", "anthropic_api_key"):
+        for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key"):
             val = cfg.get(key, "")
             if val:
                 cfg[key] = "..." + val[-4:]

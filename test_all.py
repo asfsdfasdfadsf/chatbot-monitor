@@ -771,8 +771,55 @@ def main():
     cfg4 = get("/api/config")
     test("Provider back to ollama", cfg4["config"]["provider"] == "ollama")
 
+    # ---- OpenRouter provider config ----
+    print("\n[20] OpenRouter provider config")
+
+    # Set provider to openrouter with API key
+    post("/api/config", {
+        "provider": "openrouter",
+        "openrouter_api_key": "sk-or-v1-testkey1234abcd",
+    })
+    cfg_or = get("/api/config")
+    test("Provider changed to openrouter", cfg_or["config"]["provider"] == "openrouter")
+    test("OpenRouter key is masked", cfg_or["config"]["openrouter_api_key"].startswith("..."))
+    test("OpenRouter key shows last 4 chars", cfg_or["config"]["openrouter_api_key"] == "...abcd")
+    test("Config has openrouter_api_key field", "openrouter_api_key" in cfg_or["config"])
+
+    # Masked key should not overwrite real key
+    post("/api/config", {"openrouter_api_key": "...abcd"})
+    cfg_raw_or = json.loads((Path(__file__).parent / "data" / "config.json").read_text())
+    test("OpenRouter masked key not saved over real key", cfg_raw_or["openrouter_api_key"] == "sk-or-v1-testkey1234abcd")
+
+    # OpenRouter exchange endpoint — requires admin auth
+    code_noauth, _ = expect_error("POST", "/api/openrouter/exchange",
+                                  {"code": "testcode"}, cookie="")
+    test("OpenRouter exchange requires auth", code_noauth == 401, f"got {code_noauth}")
+
+    # OpenRouter exchange — user role should be denied
+    code_user, _ = expect_error("POST", "/api/openrouter/exchange",
+                                {"code": "testcode"}, cookie=user_cookie)
+    test("OpenRouter exchange requires admin", code_user == 403, f"got {code_user}")
+
+    # OpenRouter exchange — missing code
+    code_nocode, body_nocode = expect_error("POST", "/api/openrouter/exchange",
+                                            {}, cookie=ADMIN_COOKIE)
+    test("OpenRouter exchange requires code", code_nocode == 400, f"got {code_nocode}")
+
+    # OpenRouter exchange — invalid code (will fail against real API = 502)
+    code_bad, body_bad = expect_error("POST", "/api/openrouter/exchange",
+                                      {"code": "invalid-code-xyz"}, cookie=ADMIN_COOKIE)
+    test("OpenRouter exchange with invalid code returns 502", code_bad == 502, f"got {code_bad}")
+
+    # Restore to ollama
+    post("/api/config", {
+        "provider": "ollama",
+        "openrouter_api_key": "",
+    })
+    cfg_restore = get("/api/config")
+    test("Provider restored to ollama", cfg_restore["config"]["provider"] == "ollama")
+
     # ---- Users persistence ----
-    print("\n[20] Users persistence")
+    print("\n[21] Users persistence")
     from pathlib import Path
     users_file = Path(__file__).parent / "data" / "users.json"
     test("Users file exists", users_file.exists())
@@ -781,7 +828,7 @@ def main():
         test("Users file has data", len(users_data) >= 2, f"got {len(users_data)} users")
 
     # ---- Persistence ----
-    print("\n[21] JSONL persistence")
+    print("\n[22] JSONL persistence")
     jsonl = Path(__file__).parent / "data" / "events.jsonl"
     lines = jsonl.read_text(encoding="utf-8").strip().split("\n")
     test("JSONL file has events", len(lines) >= 10, f"got {len(lines)} lines")
@@ -805,7 +852,7 @@ def main():
         test("Accounts file has admin", "admin" in acct_data)
 
     # ---- SSE ----
-    print("\n[22] SSE stream (GET /api/stream)")
+    print("\n[23] SSE stream (GET /api/stream)")
     import urllib.request
     req = urllib.request.Request(f"{BASE}/api/stream")
     req.add_header("Cookie", ADMIN_COOKIE)
@@ -817,7 +864,7 @@ def main():
     resp.close()
 
     # ---- Static files ----
-    print("\n[23] Static file serving")
+    print("\n[24] Static file serving")
     req = urllib.request.Request(f"{BASE}/")
     resp = urllib.request.urlopen(req, timeout=5)
     html = resp.read().decode()
@@ -833,7 +880,7 @@ def main():
     resp.close()
 
     # ---- Final clear ----
-    print("\n[24] Final cleanup")
+    print("\n[25] Final cleanup")
     r = post("/api/clear", {})
     test("Final clear works", r.get("ok") is True)
     h = get("/api/health", cookie="")

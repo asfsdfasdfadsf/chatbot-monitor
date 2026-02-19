@@ -313,6 +313,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
         <option value="ollama">Ollama (Local)</option>
         <option value="openai">OpenAI (ChatGPT)</option>
         <option value="anthropic">Anthropic (Claude)</option>
+        <option value="openrouter">OpenRouter (OAuth Login)</option>
       </select>
     </div>
     <div class="mf" id="cfgOllamaRow"><label>Ollama URL</label><input id="cfgUrl" value="http://localhost:11434"></div>
@@ -322,6 +323,13 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
     <div class="mf" id="cfgOpenaiUrlRow" style="display:none"><label>OpenAI Base URL</label><input id="cfgOpenaiUrl" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1"></div>
     <div class="mf" id="cfgAnthropicKeyRow" style="display:none"><label>Anthropic API Key</label>
       <div style="display:flex;gap:4px"><input id="cfgAnthropicKey" type="password" placeholder="sk-ant-..." style="flex:1"><button class="mbtn" style="font-size:10px;white-space:nowrap" onclick="toggleKeyVis('cfgAnthropicKey',this)">Show</button></div>
+    </div>
+    <div class="mf" id="cfgOpenrouterRow" style="display:none"><label>OpenRouter</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="mbtn" style="font-size:12px;padding:6px 14px;background:var(--accent);color:#fff;border-color:var(--accent)" onclick="loginOpenRouter()" id="orLoginBtn">Login with OpenRouter</button>
+        <span id="orStatus" style="font-size:11px;color:var(--text-dim)"></span>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:4px">Opens OpenRouter.ai — log in to grant access to GPT-4, Claude, and 200+ models. No API key needed.</div>
     </div>
     <div class="mf"><label>Default Model</label><select id="cfgModel"><option>loading...</option></select></div>
     <div class="mf"><label>System Prompt</label><textarea id="cfgPrompt" placeholder="e.g. Du bist ein WaWi-Assistent."></textarea></div>
@@ -690,12 +698,43 @@ function onProviderChange(){
   $('cfgOpenaiKeyRow').style.display=p==='openai'?'':'none';
   $('cfgOpenaiUrlRow').style.display=p==='openai'?'':'none';
   $('cfgAnthropicKeyRow').style.display=p==='anthropic'?'':'none';
-  // Reload models for new provider after saving
+  $('cfgOpenrouterRow').style.display=p==='openrouter'?'':'none';
+  // Update OpenRouter status
+  if(p==='openrouter'){
+    const key=appCfg.openrouter_api_key||'';
+    const st=$('orStatus');
+    if(key&&key.startsWith('...')){st.textContent='Connected';st.style.color='var(--green)';$('orLoginBtn').textContent='Reconnect'}
+    else{st.textContent='Not connected';st.style.color='var(--text-dim)';$('orLoginBtn').textContent='Login with OpenRouter'}
+  }
 }
 function toggleKeyVis(id,btn){
   const inp=$(id);
   if(inp.type==='password'){inp.type='text';btn.textContent='Hide'}
   else{inp.type='password';btn.textContent='Show'}
+}
+function loginOpenRouter(){
+  const callbackUrl=window.location.origin+'/';
+  window.location.href='https://openrouter.ai/auth?callback_url='+encodeURIComponent(callbackUrl);
+}
+async function handleOpenRouterCallback(){
+  const params=new URLSearchParams(window.location.search);
+  const code=params.get('code');
+  if(!code)return false;
+  // Clean URL
+  window.history.replaceState({},'',window.location.pathname);
+  try{
+    const r=await fetch('/api/auth/me');
+    if(!r.ok)return false; // need to be logged in first
+    const er=await fetch('/api/openrouter/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
+    const d=await er.json();
+    if(d.ok){
+      alert('OpenRouter connected! Provider switched to OpenRouter.');
+      return true;
+    }else{
+      alert('OpenRouter error: '+(d.error||'Unknown error'));
+    }
+  }catch(e){alert('OpenRouter exchange failed: '+e.message)}
+  return false;
 }
 async function loadCfg(){
   try{
@@ -752,7 +791,13 @@ function timeAgo(ts){const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+'s 
 function hlSQL(sql){let r=esc(sql);r=r.replace(/('[^']*')/g,'<span class="ss">$1</span>');r=r.replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|IS|NULL|AS|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|INDEX|COUNT|SUM|AVG|MIN|MAX|DISTINCT|BETWEEN|LIKE|UNION|ALL|EXISTS|CASE|WHEN|THEN|ELSE|END|WITH)\b/gi,'<span class="sk">$1</span>');r=r.replace(/\b(\d+\.?\d*)\b/g,'<span class="sn">$1</span>');return r}
 
 // ---- Init ----
-checkAuth();
+(async()=>{
+  // Handle OpenRouter OAuth callback if ?code= is in URL
+  if(window.location.search.includes('code=')){
+    await handleOpenRouterCallback();
+  }
+  checkAuth();
+})();
 </script>
 </body>
 </html>

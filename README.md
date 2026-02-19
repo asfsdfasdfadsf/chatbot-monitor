@@ -13,13 +13,14 @@ Users → Web Chat → FastAPI Chatbot → LLM Provider
             User: chat + own events    • Ollama (local)
                                        • OpenAI (ChatGPT)
                                        • Anthropic (Claude)
+                                       • OpenRouter (OAuth, 200+ models)
 ```
 
 Everything runs on localhost — zero config, zero dependencies, just import and go.
 
 ## Features
 
-- **Multi-provider LLM** — switch between Ollama (local), OpenAI (ChatGPT), and Anthropic (Claude)
+- **Multi-provider LLM** — switch between Ollama (local), OpenAI (ChatGPT), Anthropic (Claude), and OpenRouter (200+ models via OAuth)
 - **Live event feed** — chat, query, error, and system events in real-time via SSE
 - **Built-in chat** — proxy questions to any configured LLM provider from the dashboard
 - **SQL inspector** — syntax-highlighted queries with result tables
@@ -146,15 +147,18 @@ Admins can globally disable the bot via the dashboard or config API. When disabl
 
 ## LLM Providers
 
-The dashboard supports three LLM providers, configurable in Settings:
+The dashboard supports four LLM providers, configurable in Settings:
 
 | Provider | Models | Auth |
 |----------|--------|------|
 | **Ollama** (default) | Any local model (llama3, mistral, etc.) | No key needed |
 | **OpenAI** | GPT-4o, GPT-4, GPT-3.5-turbo, o3-mini, etc. | API key required |
 | **Anthropic** | Claude Sonnet 4, Claude Haiku 4.5, Claude 3.5 Sonnet, etc. | API key required |
+| **OpenRouter** | GPT-4, Claude, Llama, 200+ models | OAuth login (no key needed) |
 
 **Setup**: Go to Settings (admin only) → select provider → enter API key → select model → Save.
+
+**OpenRouter (OAuth)**: Select "OpenRouter (OAuth Login)" as provider → click "Login with OpenRouter" → authorize in your browser → you're connected. No API key needed — authentication happens via OAuth PKCE flow. OpenRouter gives access to 200+ models from OpenAI, Anthropic, Meta, Google, and more through a single account.
 
 **OpenAI-compatible providers**: The OpenAI Base URL can be changed to use compatible APIs like Groq (`https://api.groq.com/openai/v1`), Together.ai, Azure OpenAI, or any OpenAI-compatible endpoint.
 
@@ -308,6 +312,7 @@ def chat_endpoint(body: dict):
 | POST | `/api/accounts/<name>/priority` | Change account priority (`{priority: "high"\|"normal"\|"low"}`) |
 | POST | `/api/accounts/<name>/delete` | Delete a dashboard account |
 | POST | `/api/clear` | Clear all events |
+| POST | `/api/openrouter/exchange` | Exchange OpenRouter OAuth code for API key |
 
 ## SDK Reference
 
@@ -381,7 +386,7 @@ python server.py
 python test_all.py
 ```
 
-The test suite covers 180 tests across 24 sections: server connectivity, authentication, role-based access control, event ingestion, event queries, conversations, stats, moderation, config, Ollama chat, SDK, user management, user permissions, user status, priorities, bot toggle, account management, persistence, SSE streaming, and static file serving.
+The test suite covers 190 tests across 25 sections: server connectivity, authentication, role-based access control, event ingestion, event queries, conversations, stats, moderation, config, Ollama chat, SDK, user management, user permissions, user status, priorities, bot toggle, account management, provider config (multi-LLM), OpenRouter provider, persistence, SSE streaming, and static file serving.
 
 ## Zero Dependencies
 
@@ -394,4 +399,4 @@ Both `server.py` and `monitor.py` use only Python stdlib. No pip install needed.
 | `server.py` | HTTP server: auth, events, SSE, Ollama proxy, user/account management |
 | `monitor.py` | Python SDK: fire-and-forget logging, wrappers, middleware |
 | `public/index.html` | Dashboard UI: login, chat, feed, stats, admin panels |
-| `test_all.py` | Comprehensive test suite (180 tests) |
+| `test_all.py` | Comprehensive test suite (190 tests) |
