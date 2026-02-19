@@ -263,6 +263,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
           <div class="crow">
             <textarea class="cin" id="chatInput" rows="1" placeholder="Type a message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
             <button class="csend" id="chatSendBtn" onclick="sendChat()">Send</button>
+            <button class="hbtn" id="newChatBtn" onclick="newChat()" title="Clear conversation history and start fresh" style="min-height:38px;padding:8px 12px;font-size:12px">New Chat</button>
           </div>
           <div class="ccfg">
             <label>Model</label><select id="modelSel"><option>loading...</option></select>
@@ -317,7 +318,14 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       </select>
     </div>
     <div class="mf" id="cfgOllamaRow"><label>Ollama URL</label><input id="cfgUrl" value="http://localhost:11434"></div>
-    <div class="mf" id="cfgOpenaiKeyRow" style="display:none"><label>OpenAI API Key</label>
+    <div class="mf" id="cfgOpenaiOAuthRow" style="display:none"><label>OpenAI Account</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="mbtn" style="font-size:12px;padding:6px 14px;background:#10a37f;color:#fff;border-color:#10a37f" onclick="loginOpenAI()" id="oaiLoginBtn">Login with OpenAI</button>
+        <span id="oaiStatus" style="font-size:11px;color:var(--text-dim)"></span>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:4px">Log in with your OpenAI account via OAuth. No API key needed.</div>
+    </div>
+    <div class="mf" id="cfgOpenaiKeyRow" style="display:none"><label>OpenAI API Key <span style="font-size:9px;text-transform:none;letter-spacing:0">(or use Login above)</span></label>
       <div style="display:flex;gap:4px"><input id="cfgOpenaiKey" type="password" placeholder="sk-..." style="flex:1"><button class="mbtn" style="font-size:10px;white-space:nowrap" onclick="toggleKeyVis('cfgOpenaiKey',this)">Show</button></div>
     </div>
     <div class="mf" id="cfgOpenaiUrlRow" style="display:none"><label>OpenAI Base URL</label><input id="cfgOpenaiUrl" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1"></div>
@@ -695,10 +703,18 @@ function closeSettings(){$('settingsModal').classList.remove('open')}
 function onProviderChange(){
   const p=$('cfgProvider').value;
   $('cfgOllamaRow').style.display=p==='ollama'?'':'none';
+  $('cfgOpenaiOAuthRow').style.display=p==='openai'?'':'none';
   $('cfgOpenaiKeyRow').style.display=p==='openai'?'':'none';
   $('cfgOpenaiUrlRow').style.display=p==='openai'?'':'none';
   $('cfgAnthropicKeyRow').style.display=p==='anthropic'?'':'none';
   $('cfgOpenrouterRow').style.display=p==='openrouter'?'':'none';
+  // Update OpenAI OAuth status
+  if(p==='openai'){
+    const token=appCfg.openai_oauth_token||'';
+    const st=$('oaiStatus');
+    if(token&&token.startsWith('...')){st.textContent='Connected via OAuth';st.style.color='var(--green)';$('oaiLoginBtn').textContent='Reconnect'}
+    else{st.textContent='Not connected';st.style.color='var(--text-dim)';$('oaiLoginBtn').textContent='Login with OpenAI'}
+  }
   // Update OpenRouter status
   if(p==='openrouter'){
     const key=appCfg.openrouter_api_key||'';
@@ -716,10 +732,49 @@ function loginOpenRouter(){
   const callbackUrl=window.location.origin+'/';
   window.location.href='https://openrouter.ai/auth?callback_url='+encodeURIComponent(callbackUrl);
 }
+async function loginOpenAI(){
+  try{
+    const r=await fetch('/api/openai/auth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(d.auth_url&&d.state){
+      localStorage.setItem('openai_oauth_state',d.state);
+      window.location.href=d.auth_url;
+    }else{
+      alert('Failed to start OpenAI login: '+(d.error||'Unknown error'));
+    }
+  }catch(e){alert('OpenAI login failed: '+e.message)}
+}
+async function handleOpenAICallback(){
+  const params=new URLSearchParams(window.location.search);
+  const code=params.get('code');
+  const state=params.get('state');
+  if(!code||!state)return false;
+  const savedState=localStorage.getItem('openai_oauth_state');
+  if(!savedState||savedState!==state)return false; // Not our OAuth flow
+  localStorage.removeItem('openai_oauth_state');
+  // Clean URL
+  window.history.replaceState({},'',window.location.pathname);
+  try{
+    const r=await fetch('/api/auth/me');
+    if(!r.ok)return false; // need to be logged in first
+    const er=await fetch('/api/openai/auth/callback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,state})});
+    const d=await er.json();
+    if(d.ok){
+      alert('OpenAI connected! Provider switched to OpenAI.');
+      return true;
+    }else{
+      alert('OpenAI error: '+(d.error||'Unknown error'));
+    }
+  }catch(e){alert('OpenAI exchange failed: '+e.message)}
+  return false;
+}
 async function handleOpenRouterCallback(){
   const params=new URLSearchParams(window.location.search);
   const code=params.get('code');
   if(!code)return false;
+  // If state param is present and matches our OpenAI state, it's not OpenRouter
+  const state=params.get('state');
+  if(state&&localStorage.getItem('openai_oauth_state'))return false;
   // Clean URL
   window.history.replaceState({},'',window.location.pathname);
   try{
@@ -735,6 +790,14 @@ async function handleOpenRouterCallback(){
     }
   }catch(e){alert('OpenRouter exchange failed: '+e.message)}
   return false;
+}
+async function newChat(){
+  try{
+    await fetch('/api/chat/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  }catch(e){}
+  chatHistory=[];
+  renderChatMsgs();
+  $('chatInput').focus();
 }
 async function loadCfg(){
   try{
@@ -792,9 +855,11 @@ function hlSQL(sql){let r=esc(sql);r=r.replace(/('[^']*')/g,'<span class="ss">$1
 
 // ---- Init ----
 (async()=>{
-  // Handle OpenRouter OAuth callback if ?code= is in URL
+  // Handle OAuth callbacks if ?code= is in URL
   if(window.location.search.includes('code=')){
-    await handleOpenRouterCallback();
+    // Try OpenAI first (has state param), then OpenRouter
+    const handled=await handleOpenAICallback();
+    if(!handled)await handleOpenRouterCallback();
   }
   checkAuth();
 })();

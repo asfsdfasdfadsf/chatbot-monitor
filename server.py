@@ -8,6 +8,7 @@ live updates via SSE.
 Features: cookie-based auth, admin/user roles, bot kill switch, user priorities.
 """
 
+import base64
 import json
 import hashlib
 import os
@@ -20,12 +21,21 @@ import threading
 import queue
 from collections import defaultdict
 from datetime import datetime, timezone
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# OpenAI OAuth PKCE constants (from Codex CLI)
+# ---------------------------------------------------------------------------
+OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_AUTH_URL = "https://auth.openai.com/oauth/authorize"
+OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OPENAI_SCOPE = "openid profile email offline_access"
+OPENAI_CALLBACK_PORT = 1455  # Must match Codex CLI's registered redirect URI
 
 # ---------------------------------------------------------------------------
 # Config
@@ -50,6 +60,9 @@ config = {
     "openai_base_url": "https://api.openai.com/v1",
     "anthropic_api_key": "",
     "openrouter_api_key": "",
+    "openai_oauth_token": "",
+    "openai_refresh_token": "",
+    "openai_token_expires": 0,
 }
 config_lock = threading.Lock()
 
@@ -199,10 +212,202 @@ def _cleanup_sessions_loop():
             expired = [k for k, v in sessions.items() if v["expires_at"] <= now]
             for k in expired:
                 del sessions[k]
+        # Clean up chat history for expired sessions
+        for k in expired:
+            clear_chat_history(k)
 
 
 # Start background cleanup thread
 threading.Thread(target=_cleanup_sessions_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Chat memory — per-session conversation history
+# ---------------------------------------------------------------------------
+chat_sessions: dict[str, list[dict]] = {}  # session_id -> messages
+chat_sessions_lock = threading.Lock()
+MAX_CHAT_HISTORY = 20
+
+
+def get_chat_history(session_id: str) -> list[dict]:
+    with chat_sessions_lock:
+        return list(chat_sessions.get(session_id, []))
+
+
+def append_chat_message(session_id: str, role: str, content: str):
+    with chat_sessions_lock:
+        if session_id not in chat_sessions:
+            chat_sessions[session_id] = []
+        chat_sessions[session_id].append({"role": role, "content": content})
+        # Trim to max history (keep last MAX_CHAT_HISTORY messages)
+        if len(chat_sessions[session_id]) > MAX_CHAT_HISTORY:
+            chat_sessions[session_id] = chat_sessions[session_id][-MAX_CHAT_HISTORY:]
+
+
+def clear_chat_history(session_id: str):
+    with chat_sessions_lock:
+        chat_sessions.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI OAuth PKCE helpers
+# ---------------------------------------------------------------------------
+_openai_pkce_pending: dict[str, dict] = {}  # state -> {verifier, created_at}
+_pkce_lock = threading.Lock()
+
+
+def _pkce_code_verifier() -> str:
+    """Generate a PKCE code verifier (32 bytes, base64url-encoded, matching Codex CLI)."""
+    return secrets.token_urlsafe(32)
+
+
+def _pkce_code_challenge(verifier: str) -> str:
+    """SHA256 + base64url-encode the verifier."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+_oauth_callback_server = None
+_oauth_callback_lock = threading.Lock()
+
+
+def _start_oauth_callback_server(state: str):
+    """Spin up a temporary HTTP server on port 1455 to catch the OAuth callback.
+
+    When OpenAI redirects to http://localhost:1455/auth/callback?code=X&state=Y,
+    this server captures it and redirects the browser to our main dashboard
+    with the code+state params so the JS can complete the exchange.
+    """
+    global _oauth_callback_server
+
+    with _oauth_callback_lock:
+        # If already running, don't start another
+        if _oauth_callback_server is not None:
+            try:
+                _oauth_callback_server.shutdown()
+            except Exception:
+                pass
+            _oauth_callback_server = None
+
+    main_port = PORT
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            pass
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            code = (qs.get("code") or [""])[0]
+            cb_state = (qs.get("state") or [""])[0]
+            error = (qs.get("error") or [""])[0]
+
+            if error:
+                html = f"""<!DOCTYPE html><html><body>
+                <h2>OpenAI Login Failed</h2><p>Error: {error}</p>
+                <p><a href="http://localhost:{main_port}/">Back to Dashboard</a></p>
+                </body></html>"""
+            else:
+                # Redirect to main dashboard with code+state
+                redirect_url = f"http://localhost:{main_port}/?code={code}&state={cb_state}"
+                html = f"""<!DOCTYPE html><html><head>
+                <meta http-equiv="refresh" content="0;url={redirect_url}">
+                </head><body>Redirecting...</body></html>"""
+
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+            # Shut down after handling the callback (in a thread to not deadlock)
+            threading.Thread(target=self._shutdown, daemon=True).start()
+
+        def _shutdown(self):
+            global _oauth_callback_server
+            time.sleep(1)
+            with _oauth_callback_lock:
+                if _oauth_callback_server is not None:
+                    try:
+                        _oauth_callback_server.shutdown()
+                    except Exception:
+                        pass
+                    _oauth_callback_server = None
+
+    def _run():
+        global _oauth_callback_server
+        try:
+            from http.server import HTTPServer
+            srv = HTTPServer(("127.0.0.1", OPENAI_CALLBACK_PORT), CallbackHandler)
+            srv.timeout = 300  # 5 min max wait
+            with _oauth_callback_lock:
+                _oauth_callback_server = srv
+            srv.serve_forever()
+        except OSError:
+            pass  # Port already in use
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def refresh_openai_token() -> str | None:
+    """Use refresh_token to get a new access token. Returns new token or None."""
+    with config_lock:
+        refresh_tok = config.get("openai_refresh_token", "")
+    if not refresh_tok:
+        return None
+
+    try:
+        body = urlencode({
+            "grant_type": "refresh_token",
+            "client_id": OPENAI_CLIENT_ID,
+            "refresh_token": refresh_tok,
+            "scope": "openid profile email",
+        }).encode("utf-8")
+        req = Request(
+            OPENAI_TOKEN_URL, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        resp = urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        access_token = result.get("access_token", "")
+        new_refresh = result.get("refresh_token", refresh_tok)
+        expires_in = result.get("expires_in", 3600)
+
+        with config_lock:
+            config["openai_oauth_token"] = access_token
+            config["openai_refresh_token"] = new_refresh
+            config["openai_token_expires"] = time.time() + expires_in - 60
+        save_config()
+        return access_token
+    except Exception as e:
+        print(f"[oauth] Token refresh failed: {e}", file=sys.stderr)
+        return None
+
+
+def get_openai_bearer_token() -> str:
+    """Return a valid OpenAI bearer token. Prefers API key from token exchange, then OAuth, then manual key."""
+    with config_lock:
+        api_key = config.get("openai_api_key", "")
+        oauth_token = config.get("openai_oauth_token", "")
+        expires = config.get("openai_token_expires", 0)
+
+    # Prefer API key (obtained via OAuth token exchange) — works with all endpoints
+    if api_key:
+        return api_key
+
+    # If we have a valid OAuth token, use it
+    if oauth_token and time.time() < expires:
+        return oauth_token
+
+    # Try to refresh
+    if config.get("openai_refresh_token"):
+        new_token = refresh_openai_token()
+        if new_token:
+            return new_token
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -421,14 +626,9 @@ def ingest_event(evt: dict) -> dict:
 # ---------------------------------------------------------------------------
 # LLM providers
 # ---------------------------------------------------------------------------
-def call_ollama(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
     with config_lock:
         ollama_url = config["ollama_url"]
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": question})
 
     body: dict = {"model": model, "messages": messages, "stream": False}
     if temperature is not None:
@@ -447,51 +647,110 @@ def call_ollama(question: str, model: str, system_prompt: str, temperature: floa
     return answer, round(duration_ms, 1)
 
 
-def call_openai(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+def _using_oauth_token() -> bool:
+    """Check if we're using a raw OAuth token (no API key from token exchange)."""
     with config_lock:
-        api_key = config["openai_api_key"]
+        has_api_key = bool(config.get("openai_api_key"))
+        has_oauth = bool(config.get("openai_oauth_token"))
+    # Only use Responses API if we have OAuth but no proper API key
+    return has_oauth and not has_api_key
+
+
+def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
+    with config_lock:
         base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
 
-    if not api_key:
-        raise ValueError("OpenAI API key not configured")
+    bearer = get_openai_bearer_token()
+    if not bearer:
+        raise ValueError("OpenAI API key not configured — use Login with OpenAI or set an API key in Settings")
 
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": question})
-
-    body = {"model": model, "messages": messages}
-    if temperature is not None:
-        body["temperature"] = temperature
+    use_responses_api = _using_oauth_token()
 
     start = time.time()
-    data = json.dumps(body).encode("utf-8")
-    req = Request(
-        f"{base_url}/chat/completions", data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    resp = urlopen(req, timeout=120)
-    result = json.loads(resp.read())
-    answer = result["choices"][0]["message"]["content"]
+
+    if use_responses_api:
+        # ChatGPT subscription OAuth tokens must use the Responses API
+        # Convert messages to a single input string for simple queries,
+        # or use the instructions + input pattern for system + user messages
+        system_text = ""
+        input_parts = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text = m["content"]
+            else:
+                input_parts.append(m)
+
+        body = {"model": model}
+        if system_text:
+            body["instructions"] = system_text
+        # Build input as conversation messages
+        body["input"] = [{"role": m["role"], "content": m["content"]} for m in input_parts]
+        if temperature is not None:
+            body["temperature"] = temperature
+
+        data = json.dumps(body).encode("utf-8")
+        req = Request(
+            f"{base_url}/responses", data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bearer}",
+            },
+            method="POST",
+        )
+        resp = urlopen(req, timeout=120)
+        result = json.loads(resp.read())
+        # Extract text from Responses API output
+        answer = ""
+        for item in result.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        answer += c.get("text", "")
+        if not answer:
+            answer = result.get("output_text", "") or str(result)
+    else:
+        # Standard API key — use Chat Completions API
+        body = {"model": model, "messages": messages}
+        if temperature is not None:
+            body["temperature"] = temperature
+
+        data = json.dumps(body).encode("utf-8")
+        req = Request(
+            f"{base_url}/chat/completions", data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bearer}",
+            },
+            method="POST",
+        )
+        resp = urlopen(req, timeout=120)
+        result = json.loads(resp.read())
+        answer = result["choices"][0]["message"]["content"]
+
     duration_ms = (time.time() - start) * 1000
     return answer, round(duration_ms, 1)
 
 
-def call_anthropic(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+def call_anthropic(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
     with config_lock:
         api_key = config["anthropic_api_key"]
 
     if not api_key:
         raise ValueError("Anthropic API key not configured")
 
+    # Anthropic API requires system prompt in a separate field
+    system_prompt = ""
+    chat_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_prompt = m["content"]
+        else:
+            chat_messages.append(m)
+
     body: dict = {
         "model": model,
         "max_tokens": 4096,
-        "messages": [{"role": "user", "content": question}],
+        "messages": chat_messages,
     }
     if system_prompt:
         body["system"] = system_prompt
@@ -516,17 +775,12 @@ def call_anthropic(question: str, model: str, system_prompt: str, temperature: f
     return answer, round(duration_ms, 1)
 
 
-def call_openrouter(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+def call_openrouter(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
     with config_lock:
         api_key = config["openrouter_api_key"]
 
     if not api_key:
         raise ValueError("OpenRouter API key not configured — use Login with OpenRouter in Settings")
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": question})
 
     body = {"model": model, "messages": messages}
     if temperature is not None:
@@ -551,27 +805,33 @@ def call_openrouter(question: str, model: str, system_prompt: str, temperature: 
     return answer, round(duration_ms, 1)
 
 
-def call_llm(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+def call_llm(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
     """Dispatch to the configured LLM provider."""
     with config_lock:
         provider = config.get("provider", "ollama")
     if provider == "openai":
-        return call_openai(question, model, system_prompt, temperature)
+        return call_openai(messages, model, temperature)
     elif provider == "anthropic":
-        return call_anthropic(question, model, system_prompt, temperature)
+        return call_anthropic(messages, model, temperature)
     elif provider == "openrouter":
-        return call_openrouter(question, model, system_prompt, temperature)
+        return call_openrouter(messages, model, temperature)
     else:
-        return call_ollama(question, model, system_prompt, temperature)
+        return call_ollama(messages, model, temperature)
 
 
 OPENAI_MODELS = [
+    {"name": "gpt-5.2", "size": 0},
+    {"name": "gpt-5.2-chat-latest", "size": 0},
+    {"name": "gpt-5.2-pro", "size": 0},
+    {"name": "gpt-5.2-codex", "size": 0},
+    {"name": "gpt-4.1", "size": 0},
+    {"name": "gpt-4.1-mini", "size": 0},
+    {"name": "gpt-4.1-nano", "size": 0},
     {"name": "gpt-4o", "size": 0},
     {"name": "gpt-4o-mini", "size": 0},
-    {"name": "gpt-4-turbo", "size": 0},
-    {"name": "gpt-4", "size": 0},
-    {"name": "gpt-3.5-turbo", "size": 0},
+    {"name": "o3", "size": 0},
     {"name": "o3-mini", "size": 0},
+    {"name": "o4-mini", "size": 0},
 ]
 
 ANTHROPIC_MODELS = [
@@ -588,15 +848,15 @@ def list_models() -> list[dict]:
         provider = config.get("provider", "ollama")
 
     if provider == "openai":
+        bearer = get_openai_bearer_token()
         with config_lock:
-            api_key = config["openai_api_key"]
             base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
-        if not api_key:
+        if not bearer:
             return OPENAI_MODELS  # fallback list
         try:
             req = Request(
                 f"{base_url}/models", method="GET",
-                headers={"Authorization": f"Bearer {api_key}"},
+                headers={"Authorization": f"Bearer {bearer}"},
             )
             resp = urlopen(req, timeout=5)
             data = json.loads(resp.read())
@@ -605,7 +865,7 @@ def list_models() -> list[dict]:
             chat_models = [
                 {"name": m["id"], "size": 0}
                 for m in models
-                if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "o4"))
+                if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "o4", "chatgpt-"))
             ]
             return sorted(chat_models, key=lambda x: x["name"]) if chat_models else OPENAI_MODELS
         except Exception:
@@ -829,8 +1089,23 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self._handle_chat(session)
+        if path == "/api/chat/clear":
+            session = self._require_auth("user")
+            if not session:
+                return
+            return self._handle_chat_clear(session)
 
         # Admin-level routes
+        if path == "/api/openai/auth/start":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_openai_auth_start()
+        if path == "/api/openai/auth/callback":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_openai_auth_callback()
         if path == "/api/openrouter/exchange":
             session = self._require_auth("admin")
             if not session:
@@ -939,6 +1214,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def _handle_logout(self):
         session, sid = self._get_session()
         if sid:
+            clear_chat_history(sid)
             delete_session(sid)
         self._send_json({"ok": True}, headers=[self._clear_cookie()])
 
@@ -979,6 +1255,139 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"ok": True, "provider": "openrouter"})
         except Exception as e:
             self._send_json({"error": f"OpenRouter exchange failed: {e}"}, 502)
+
+    def _handle_chat_clear(self, session: dict):
+        """Clear chat history for the current session."""
+        _, sid = self._get_session()
+        if sid:
+            clear_chat_history(sid)
+        self._send_json({"ok": True})
+
+    def _handle_openai_auth_start(self):
+        """Generate PKCE verifier/challenge and return auth URL."""
+        verifier = _pkce_code_verifier()
+        challenge = _pkce_code_challenge(verifier)
+        state = secrets.token_urlsafe(32)
+
+        # Store pending PKCE state
+        with _pkce_lock:
+            # Clean old entries (> 10 min)
+            now = time.time()
+            expired = [k for k, v in _openai_pkce_pending.items()
+                       if now - v["created_at"] > 600]
+            for k in expired:
+                del _openai_pkce_pending[k]
+            _openai_pkce_pending[state] = {
+                "verifier": verifier,
+                "created_at": now,
+            }
+
+        # Must use port 1455 + /auth/callback — that's what's registered with the Codex client_id
+        callback_url = f"http://localhost:{OPENAI_CALLBACK_PORT}/auth/callback"
+        params = urlencode({
+            "response_type": "code",
+            "client_id": OPENAI_CLIENT_ID,
+            "redirect_uri": callback_url,
+            "scope": OPENAI_SCOPE,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "codex_cli_simplified_flow": "true",
+            "id_token_add_organizations": "true",
+        })
+        auth_url = f"{OPENAI_AUTH_URL}?{params}"
+
+        # Start temporary callback server on port 1455 to catch the redirect
+        _start_oauth_callback_server(state)
+
+        self._send_json({"auth_url": auth_url, "state": state})
+
+    def _handle_openai_auth_callback(self):
+        """Exchange authorization code + PKCE verifier for tokens, then obtain API key."""
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        code = data.get("code", "").strip()
+        state = data.get("state", "").strip()
+        if not code or not state:
+            self._send_json({"error": "code and state are required"}, 400)
+            return
+
+        # Look up PKCE verifier
+        with _pkce_lock:
+            pending = _openai_pkce_pending.pop(state, None)
+        if not pending:
+            self._send_json({"error": "invalid or expired state"}, 400)
+            return
+
+        verifier = pending["verifier"]
+        callback_url = f"http://localhost:{OPENAI_CALLBACK_PORT}/auth/callback"
+
+        try:
+            # Step 1: Exchange auth code for tokens (access_token, id_token, refresh_token)
+            token_body = urlencode({
+                "grant_type": "authorization_code",
+                "client_id": OPENAI_CLIENT_ID,
+                "code": code,
+                "redirect_uri": callback_url,
+                "code_verifier": verifier,
+            }).encode("utf-8")
+            req = Request(
+                OPENAI_TOKEN_URL, data=token_body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            resp = urlopen(req, timeout=10)
+            result = json.loads(resp.read())
+
+            access_token = result.get("access_token", "")
+            id_token = result.get("id_token", "")
+            refresh_token = result.get("refresh_token", "")
+            expires_in = result.get("expires_in", 3600)
+
+            if not access_token:
+                self._send_json({"error": "No access_token returned from OpenAI"}, 502)
+                return
+
+            # Step 2: Exchange id_token for an API key (like Codex CLI does)
+            # This converts the ChatGPT subscription OAuth token into a usable API key
+            api_key = ""
+            if id_token:
+                try:
+                    exchange_body = urlencode({
+                        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                        "client_id": OPENAI_CLIENT_ID,
+                        "requested_token": "openai-api-key",
+                        "subject_token": id_token,
+                        "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                    }).encode("utf-8")
+                    req2 = Request(
+                        OPENAI_TOKEN_URL, data=exchange_body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        method="POST",
+                    )
+                    resp2 = urlopen(req2, timeout=10)
+                    result2 = json.loads(resp2.read())
+                    api_key = result2.get("access_token", "")
+                except Exception:
+                    pass  # API key exchange is optional, fall back to OAuth token
+
+            with config_lock:
+                config["openai_oauth_token"] = access_token
+                config["openai_refresh_token"] = refresh_token
+                config["openai_token_expires"] = time.time() + expires_in - 60
+                if api_key:
+                    config["openai_api_key"] = api_key
+                config["provider"] = "openai"
+            save_config()
+
+            self._send_json({"ok": True, "provider": "openai", "has_api_key": bool(api_key)})
+        except Exception as e:
+            self._send_json({"error": f"OpenAI token exchange failed: {e}"}, 502)
 
     # --- Event handlers ---
 
@@ -1042,8 +1451,20 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             system_prompt = data.get("system_prompt", config["system_prompt"])
             temperature = data.get("temperature", config["temperature"])
 
+        # Get session ID for chat history
+        _, sid = self._get_session()
+
+        # Append user message to session history
+        append_chat_message(sid, "user", question)
+
+        # Build messages: system prompt + history
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(get_chat_history(sid))
+
         try:
-            answer, duration_ms = call_llm(question, model, system_prompt, temperature)
+            answer, duration_ms = call_llm(messages, model, temperature)
         except Exception as e:
             ingest_event({
                 "type": "error", "message": str(e),
@@ -1051,6 +1472,9 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             })
             self._send_json({"error": str(e)}, 502)
             return
+
+        # Append assistant response to session history
+        append_chat_message(sid, "assistant", answer)
 
         evt = ingest_event({
             "type": "chat", "user_id": user_id, "question": question,
@@ -1080,8 +1504,9 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                         "provider", "openai_base_url"):
                 if key in data:
                     config[key] = data[key]
-            # Only update API keys if a real value is sent (not masked); allow empty to clear
-            for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key"):
+            # Only update API keys/tokens if a real value is sent (not masked); allow empty to clear
+            for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key",
+                         "openai_oauth_token", "openai_refresh_token"):
                 if key in data and not str(data[key]).startswith("..."):
                     config[key] = data[key]
             if "provider" in data and data["provider"] in ("ollama", "openai", "anthropic", "openrouter"):
@@ -1261,6 +1686,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         # Public routes (no auth required)
+        if path == "/auth/callback":
+            return self._handle_openai_oauth_redirect(params)
         if path == "/api/auth/me":
             return self._handle_me()
         if path.startswith("/api/users/") and path.endswith("/check"):
@@ -1348,6 +1775,28 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "not_authenticated"}, 401)
             return
         self._send_json({"user": {"username": session["username"], "role": session["role"]}})
+
+    def _handle_openai_oauth_redirect(self, params: dict):
+        """Serve a small HTML page that relays the OAuth code+state to the main dashboard."""
+        code = (params.get("code") or [""])[0]
+        state = (params.get("state") or [""])[0]
+        error = (params.get("error") or [""])[0]
+        # Redirect to dashboard root with the params so the JS can pick them up
+        if error:
+            html = f"""<!DOCTYPE html><html><body>
+            <h2>OpenAI Login Failed</h2><p>Error: {error}</p>
+            <p><a href="/">Back to Dashboard</a></p></body></html>"""
+        else:
+            # Redirect to / with code+state so the existing JS handler picks it up
+            html = f"""<!DOCTYPE html><html><head>
+            <meta http-equiv="refresh" content="0;url=/?code={code}&state={state}">
+            </head><body>Redirecting...</body></html>"""
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_static(self, path: str):
         if path == "/" or path == "":
@@ -1517,8 +1966,9 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def _handle_get_config(self):
         with config_lock:
             cfg = dict(config)
-        # Mask API keys — show only last 4 chars
-        for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key"):
+        # Mask API keys and tokens — show only last 4 chars
+        for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key",
+                     "openai_oauth_token", "openai_refresh_token"):
             val = cfg.get(key, "")
             if val:
                 cfg[key] = "..." + val[-4:]

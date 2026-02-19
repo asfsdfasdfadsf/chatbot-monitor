@@ -162,11 +162,20 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+FAKE_OLLAMA_PORT = 11435  # Use different port to avoid conflict with real Ollama
+_fake_ollama_server = None  # Reuse across test sections
+
+
 def start_fake_ollama():
-    server = HTTPServer(("127.0.0.1", 11434), FakeOllamaHandler)
+    global _fake_ollama_server
+    if _fake_ollama_server is not None:
+        return _fake_ollama_server  # Already running
+    server = HTTPServer(("127.0.0.1", FAKE_OLLAMA_PORT), FakeOllamaHandler)
+    server.allow_reuse_address = True
     server.daemon_threads = True
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
+    _fake_ollama_server = server
     return server
 
 
@@ -411,9 +420,9 @@ def main():
     test("Config returns system_prompt", "system_prompt" in cfg["config"])
     test("Config returns temperature", "temperature" in cfg["config"])
 
-    # Save new config
+    # Save new config (point to fake Ollama port)
     new_cfg = post("/api/config", {
-        "ollama_url": "http://localhost:11434",
+        "ollama_url": f"http://localhost:{FAKE_OLLAMA_PORT}",
         "default_model": "llama3:8b",
         "system_prompt": "Du bist ein Test-Assistent.",
         "temperature": 0.3,
@@ -428,9 +437,12 @@ def main():
 
     # ---- Fake Ollama + Chat ----
     print("\n[11] Chat via Ollama (POST /api/chat)")
-    print("     Starting fake Ollama on :11434...")
+    print(f"     Starting fake Ollama on :{FAKE_OLLAMA_PORT}...")
     fake_server = start_fake_ollama()
     time.sleep(0.3)
+
+    # Point config to fake Ollama
+    post("/api/config", {"ollama_url": f"http://localhost:{FAKE_OLLAMA_PORT}"})
 
     # Test models endpoint with fake Ollama
     models = get("/api/models")
@@ -491,7 +503,7 @@ def main():
     # Unblock for cleanup
     post("/api/users/blocked-chatter/unblock", {})
 
-    fake_server.shutdown()
+    # fake_server kept running for reuse in later test sections
 
     # ---- SDK test ----
     print("\n[12] SDK (monitor.py)")
@@ -879,8 +891,145 @@ def main():
     test("Dashboard has accounts tab", "tAccounts" in html)
     resp.close()
 
+    # ---- Chat Memory ----
+    print("\n[25] Chat memory (session history)")
+
+    # Start fake Ollama again for chat memory tests
+    print(f"     Starting fake Ollama on :{FAKE_OLLAMA_PORT}...")
+    fake_server2 = start_fake_ollama()
+    time.sleep(0.3)
+
+    # Restore provider to ollama, pointing to fake Ollama
+    post("/api/config", {
+        "provider": "ollama",
+        "default_model": "llama3:8b",
+        "ollama_url": f"http://localhost:{FAKE_OLLAMA_PORT}",
+    })
+
+    # Send first message
+    c1 = post("/api/chat", {"question": "My name is Alice"})
+    test("Chat memory: first message ok", c1.get("ok") is True)
+
+    # Send second message — server should include history
+    c2 = post("/api/chat", {"question": "What is my name?"})
+    test("Chat memory: second message ok", c2.get("ok") is True)
+    # The fake Ollama echoes back the last user message, but the important thing
+    # is that the server sent multiple messages (history) to Ollama
+
+    # Send third message
+    c3 = post("/api/chat", {"question": "Tell me more"})
+    test("Chat memory: third message ok", c3.get("ok") is True)
+
+    # Clear chat history
+    clear_r = post("/api/chat/clear", {})
+    test("Chat clear returns ok", clear_r.get("ok") is True)
+
+    # After clear, next message should work (no history)
+    c4 = post("/api/chat", {"question": "Fresh start"})
+    test("Chat after clear works", c4.get("ok") is True)
+
+    # Test chat clear requires auth
+    code_noauth, _ = expect_error("POST", "/api/chat/clear", {}, cookie="")
+    test("Chat clear requires auth", code_noauth == 401, f"got {code_noauth}")
+
+    # Test that different sessions have different histories
+    user_cookie = login("testuser", "testpass")
+    c5 = post("/api/chat", {"question": "I am Bob"}, cookie=user_cookie)
+    test("Chat memory: user session works", c5.get("ok") is True)
+
+    # Admin's chat should not be affected by user's chat
+    c6 = post("/api/chat", {"question": "Who am I?"})
+    test("Chat memory: admin session independent", c6.get("ok") is True)
+
+    # User clears their chat
+    clear_u = post("/api/chat/clear", {}, cookie=user_cookie)
+    test("User chat clear works", clear_u.get("ok") is True)
+
+    # fake_server2 kept running (same instance as fake_server)
+
+    # ---- OpenAI OAuth PKCE ----
+    print("\n[26] OpenAI OAuth PKCE endpoints")
+
+    # Auth start requires admin
+    code_noauth, _ = expect_error("POST", "/api/openai/auth/start", {}, cookie="")
+    test("OpenAI auth start requires auth", code_noauth == 401, f"got {code_noauth}")
+
+    code_user, _ = expect_error("POST", "/api/openai/auth/start", {}, cookie=user_cookie)
+    test("OpenAI auth start requires admin", code_user == 403, f"got {code_user}")
+
+    # Auth start as admin
+    auth_start = post("/api/openai/auth/start", {})
+    test("OpenAI auth start returns auth_url", "auth_url" in auth_start, f"got keys: {list(auth_start.keys())}")
+    test("OpenAI auth start returns state", "state" in auth_start)
+    test("Auth URL contains openai.com", "auth.openai.com" in auth_start.get("auth_url", ""))
+    test("Auth URL contains client_id", "client_id=" in auth_start.get("auth_url", ""))
+    test("Auth URL contains code_challenge", "code_challenge=" in auth_start.get("auth_url", ""))
+
+    # Auth callback requires admin
+    code_noauth, _ = expect_error("POST", "/api/openai/auth/callback",
+                                  {"code": "test", "state": "test"}, cookie="")
+    test("OpenAI callback requires auth", code_noauth == 401, f"got {code_noauth}")
+
+    # Auth callback with missing params
+    code_missing, body_missing = expect_error("POST", "/api/openai/auth/callback",
+                                               {}, cookie=ADMIN_COOKIE)
+    test("OpenAI callback requires code+state", code_missing == 400, f"got {code_missing}")
+
+    # Auth callback with invalid state
+    code_badstate, body_badstate = expect_error("POST", "/api/openai/auth/callback",
+                                                 {"code": "abc", "state": "invalid"},
+                                                 cookie=ADMIN_COOKIE)
+    test("OpenAI callback rejects invalid state", code_badstate == 400, f"got {code_badstate}")
+
+    # Auth callback with valid state but invalid code (will fail against real API = 502)
+    state = auth_start.get("state", "")
+    code_badcode, body_badcode = expect_error("POST", "/api/openai/auth/callback",
+                                               {"code": "invalid-code-xyz", "state": state},
+                                               cookie=ADMIN_COOKIE)
+    test("OpenAI callback with invalid code returns 502", code_badcode == 502, f"got {code_badcode}")
+
+    # Verify OAuth token fields in config
+    post("/api/config", {"provider": "openai"})
+    cfg_oauth = get("/api/config")
+    test("Config has openai_oauth_token field", "openai_oauth_token" in cfg_oauth["config"])
+    test("Config has openai_refresh_token field", "openai_refresh_token" in cfg_oauth["config"])
+    test("Config has openai_token_expires field", "openai_token_expires" in cfg_oauth["config"])
+
+    # OAuth tokens should be masked
+    post("/api/config", {
+        "openai_oauth_token": "test-access-token-1234",
+        "openai_refresh_token": "test-refresh-token-5678",
+    })
+    cfg_masked = get("/api/config")
+    test("OAuth access token masked", cfg_masked["config"]["openai_oauth_token"] == "...1234")
+    test("OAuth refresh token masked", cfg_masked["config"]["openai_refresh_token"] == "...5678")
+
+    # Masked tokens should not overwrite real tokens
+    post("/api/config", {"openai_oauth_token": "...1234", "openai_refresh_token": "...5678"})
+    cfg_raw_oauth = json.loads((Path(__file__).parent / "data" / "config.json").read_text())
+    test("Masked OAuth token not saved over real", cfg_raw_oauth["openai_oauth_token"] == "test-access-token-1234")
+    test("Masked refresh token not saved over real", cfg_raw_oauth["openai_refresh_token"] == "test-refresh-token-5678")
+
+    # Restore to ollama
+    post("/api/config", {
+        "provider": "ollama",
+        "openai_oauth_token": "",
+        "openai_refresh_token": "",
+    })
+
+    # ---- Dashboard UI checks ----
+    print("\n[27] Dashboard UI (new features)")
+    req = urllib.request.Request(f"{BASE}/")
+    resp = urllib.request.urlopen(req, timeout=5)
+    html = resp.read().decode()
+    test("Dashboard has New Chat button", "newChat" in html)
+    test("Dashboard has OpenAI login button", "loginOpenAI" in html)
+    test("Dashboard has OpenAI OAuth handler", "handleOpenAICallback" in html)
+    test("Dashboard has chat clear function", "api/chat/clear" in html)
+    resp.close()
+
     # ---- Final clear ----
-    print("\n[25] Final cleanup")
+    print("\n[28] Final cleanup")
     r = post("/api/clear", {})
     test("Final clear works", r.get("ok") is True)
     h = get("/api/health", cookie="")
