@@ -174,10 +174,50 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .mactions button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
 
 @media (max-width:1100px) { .panels { grid-template-columns:240px 1fr 260px; } }
+
+/* Login Screen */
+.login-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:var(--bg); z-index:200; display:flex; align-items:center; justify-content:center; }
+.login-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:32px; width:360px; max-width:90vw; }
+.login-card h2 { font-size:18px; margin-bottom:4px; text-align:center; }
+.login-card h2 span { color:var(--accent); }
+.login-card .login-sub { font-size:12px; color:var(--text-dim); text-align:center; margin-bottom:20px; }
+.login-tabs { display:flex; margin-bottom:16px; border-bottom:1px solid var(--border); }
+.login-tab { flex:1; padding:8px; border:none; background:transparent; color:var(--text-dim); font-size:13px; cursor:pointer; border-bottom:2px solid transparent; transition:all .15s; }
+.login-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+.login-field { margin-bottom:12px; }
+.login-field input { width:100%; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:13px; font-family:inherit; outline:none; box-sizing:border-box; }
+.login-field input:focus { border-color:var(--accent); }
+.login-btn { width:100%; padding:10px; border-radius:6px; border:none; background:var(--accent); color:#fff; font-size:14px; font-weight:600; cursor:pointer; transition:opacity .15s; }
+.login-btn:hover { opacity:.85; }
+.login-btn:disabled { opacity:.4; cursor:not-allowed; }
+.login-error { color:var(--red); font-size:12px; text-align:center; margin-top:8px; min-height:18px; }
+.role-badge { font-size:10px; font-weight:600; padding:1px 6px; border-radius:6px; text-transform:uppercase; }
+.role-badge.admin { background:rgba(248,81,73,0.15); color:var(--red); }
+.role-badge.user { background:rgba(88,166,255,0.15); color:var(--accent); }
+.user-header-info { display:flex; align-items:center; gap:6px; margin-left:8px; }
 </style>
 </head>
 <body>
-<div class="app">
+
+<!-- Login Screen -->
+<div class="login-overlay" id="loginScreen">
+  <div class="login-card">
+    <h2><span>WaWi</span> Chatbot Monitor</h2>
+    <div class="login-sub">Sign in to access the dashboard</div>
+    <div class="login-tabs">
+      <button class="login-tab active" id="ltLogin" onclick="loginTab('login')">Login</button>
+      <button class="login-tab" id="ltRegister" onclick="loginTab('register')">Register</button>
+    </div>
+    <div id="loginForm">
+      <div class="login-field"><input type="text" id="authUser" placeholder="Username" onkeydown="if(event.key==='Enter')doAuth()"></div>
+      <div class="login-field"><input type="password" id="authPass" placeholder="Password" onkeydown="if(event.key==='Enter')doAuth()"></div>
+      <button class="login-btn" id="authBtn" onclick="doAuth()">Login</button>
+      <div class="login-error" id="authError"></div>
+    </div>
+  </div>
+</div>
+
+<div class="app" style="display:none">
   <div class="header">
     <h1><span>WaWi</span> Chatbot Monitor</h1>
     <div class="header-stats">
@@ -186,8 +226,13 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       <span>Errors: <span class="sv" id="hErrors">0</span></span>
       <span>Avg: <span class="sv" id="hAvg">0ms</span></span>
     </div>
-    <button class="hbtn" onclick="openSettings()">Settings</button>
-    <button class="hbtn danger" onclick="clearEvents()">Clear All</button>
+    <div class="user-header-info" id="userHeaderInfo">
+      <span id="hUserName">admin</span>
+      <span class="role-badge admin" id="hUserRole">admin</span>
+      <button class="hbtn" onclick="doLogout()">Logout</button>
+    </div>
+    <button class="hbtn admin-only" id="btnSettings" onclick="openSettings()">Settings</button>
+    <button class="hbtn danger admin-only" id="btnClear" onclick="clearEvents()">Clear All</button>
     <div class="cdot" id="connDot" title="Disconnected"></div>
   </div>
 
@@ -210,7 +255,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       <div class="tabs" id="centerTabs">
         <button class="tab active" data-t="chat" onclick="cTab('chat')">Chat</button>
         <button class="tab" data-t="detail" onclick="cTab('detail')">Detail</button>
-        <button class="tab" data-t="sql" onclick="cTab('sql')">SQL <span class="tbadge hide" id="sqlBadge">0</span></button>
+        <button class="tab admin-only" data-t="sql" onclick="cTab('sql')">SQL <span class="tbadge hide" id="sqlBadge">0</span></button>
       </div>
       <div id="tChat" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
         <div class="cmsg" id="chatMessages"><div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Messages go to your local Ollama</div></div></div>
@@ -221,7 +266,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
           </div>
           <div class="ccfg">
             <label>Model</label><select id="modelSel"><option>loading...</option></select>
-            <label style="margin-left:8px">User</label><input id="chatUid" value="admin" style="width:80px">
+            <label style="margin-left:8px" class="admin-only" id="chatUidLabel">User</label><input id="chatUid" value="admin" style="width:80px" class="admin-only">
           </div>
         </div>
       </div>
@@ -242,14 +287,18 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
     <!-- RIGHT: Users / Stats -->
     <div class="panel">
       <div class="tabs">
-        <button class="tab active" data-t="users" onclick="rTab('users')">Users <span class="tbadge hide" id="usersBadge">0</span></button>
+        <button class="tab active admin-only" data-t="users" onclick="rTab('users')">Users <span class="tbadge hide" id="usersBadge">0</span></button>
         <button class="tab" data-t="stats" onclick="rTab('stats')">Stats</button>
+        <button class="tab admin-only" data-t="accounts" onclick="rTab('accounts')">Accounts</button>
       </div>
       <div id="tUsers" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
         <div class="panel-body" id="usersBody"><div class="dempty">No users yet</div></div>
       </div>
       <div id="tStats" style="display:none;flex-direction:column;flex:1;overflow:hidden">
         <div class="panel-body" id="statsBody"></div>
+      </div>
+      <div id="tAccounts" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+        <div class="panel-body" id="accountsBody"><div class="dempty">Loading accounts...</div></div>
       </div>
     </div>
   </div>
@@ -271,46 +320,120 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 let events=[],moderation={},usersMap={},selectedId=null,selectedUser=null;
 let activeFilter='all',centerTab='chat',rightTab='users';
 let connected=false,sending=false,chatHistory=[],ollamaModels=[],appCfg={};
+let currentUser=null; // {username, role}
+let authMode='login';
+let statsInterval=null;
+
+// ---- Auth Flow ----
+async function checkAuth(){
+  try{
+    const r=await fetch('/api/auth/me');
+    if(r.ok){const d=await r.json();currentUser=d.user;showDashboard()}
+    else showLogin();
+  }catch(e){showLogin()}
+}
+function showLogin(){
+  $('loginScreen').style.display='flex';
+  document.querySelector('.app').style.display='none';
+  $('authUser').focus();
+}
+function showDashboard(){
+  $('loginScreen').style.display='none';
+  document.querySelector('.app').style.display='grid';
+  $('hUserName').textContent=currentUser.username;
+  const rb=$('hUserRole');rb.textContent=currentUser.role;rb.className='role-badge '+currentUser.role;
+  if(currentUser.role!=='admin')$('chatUid').value=currentUser.username;
+  applyRole(currentUser.role);
+  connectSSE();
+  loadModels();
+  if(currentUser.role==='admin'){
+    loadCfg();
+    statsInterval=setInterval(refreshStats,10000);
+    setTimeout(refreshStats,500);
+  }
+}
+function applyRole(role){
+  document.querySelectorAll('.admin-only').forEach(el=>{
+    el.style.display=role==='admin'?'':'none';
+  });
+  // For non-admin: hide moderation bar, switch to stats tab on right
+  if(role!=='admin'){
+    $('modBar').style.display='none';
+    rTab('stats');
+  }
+}
+function loginTab(mode){
+  authMode=mode;
+  $('ltLogin').classList.toggle('active',mode==='login');
+  $('ltRegister').classList.toggle('active',mode==='register');
+  $('authBtn').textContent=mode==='login'?'Login':'Register';
+  $('authError').textContent='';
+}
+async function doAuth(){
+  const user=$('authUser').value.trim(),pass=$('authPass').value;
+  if(!user||!pass){$('authError').textContent='Enter username and password';return}
+  $('authBtn').disabled=true;$('authError').textContent='';
+  const endpoint=authMode==='login'?'/api/auth/login':'/api/auth/register';
+  try{
+    const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass})});
+    const d=await r.json();
+    if(r.ok&&d.ok){currentUser=d.user;showDashboard()}
+    else{
+      const msg=d.error==='invalid_credentials'?'Invalid username or password':d.error==='username_taken'?'Username already taken':d.error||'Login failed';
+      $('authError').textContent=msg;
+    }
+  }catch(e){$('authError').textContent='Connection error'}
+  $('authBtn').disabled=false;
+}
+async function doLogout(){
+  try{await fetch('/api/auth/logout',{method:'POST'})}catch(e){}
+  currentUser=null;events=[];moderation={};usersMap={};
+  if(statsInterval){clearInterval(statsInterval);statsInterval=null}
+  showLogin();
+}
 
 // ---- SSE ----
 function connectSSE(){
   const es=new EventSource('/api/stream'),dot=$('connDot');
   es.onopen=()=>{connected=true;dot.className='cdot on';dot.title='Connected'};
   es.onerror=()=>{connected=false;dot.className='cdot';dot.title='Reconnecting...'};
-  es.addEventListener('init',e=>{events=JSON.parse(e.data);renderFeed();renderSql();refreshStats()});
+  es.addEventListener('session',e=>{const s=JSON.parse(e.data);currentUser=s;applyRole(s.role)});
+  es.addEventListener('init',e=>{events=JSON.parse(e.data);renderFeed();renderSql();if(currentUser?.role==='admin')refreshStats()});
   es.addEventListener('moderation',e=>{moderation=JSON.parse(e.data);renderFeed();if(selectedId)renderDetail(selectedId)});
   es.addEventListener('users',e=>{usersMap=JSON.parse(e.data);renderUsers()});
   es.onmessage=e=>{
     const evt=JSON.parse(e.data);
-    if(evt.type==='_clear'){events=[];moderation={};selectedId=null;renderFeed();renderSql();refreshStats();$('detailBody').innerHTML='<div class="dempty">Select an event</div>';$('modBar').style.display='none';return}
-    if(evt.type==='_moderation_update'){moderation[evt.event_id]=evt.moderation;renderFeed();if(selectedId===evt.event_id)renderDetail(selectedId);refreshStats();return}
+    if(evt.type==='_clear'){events=[];moderation={};selectedId=null;renderFeed();renderSql();if(currentUser?.role==='admin')refreshStats();$('detailBody').innerHTML='<div class="dempty">Select an event</div>';$('modBar').style.display='none';return}
+    if(evt.type==='_moderation_update'){moderation[evt.event_id]=evt.moderation;renderFeed();if(selectedId===evt.event_id)renderDetail(selectedId);if(currentUser?.role==='admin')refreshStats();return}
     if(evt.type==='_user_update'){if(usersMap[evt.user_id])usersMap[evt.user_id].status=evt.status;renderUsers();if(selectedUser===evt.user_id)showUserDetail(evt.user_id);return}
     events.push(evt);if(events.length>5000)events.shift();
     addFeedItem(evt);if(evt.type==='query')addSqlItem(evt);
-    // Update user in local map
     if(evt.user_id&&evt.user_id!=='admin'){
       if(!usersMap[evt.user_id])usersMap[evt.user_id]={user_id:evt.user_id,status:'active',first_seen:evt.timestamp,last_seen:evt.timestamp,message_count:0};
       usersMap[evt.user_id].last_seen=evt.timestamp;
       if(evt.type==='chat')usersMap[evt.user_id].message_count=(usersMap[evt.user_id].message_count||0)+1;
       renderUsers();
     }
-    refreshStats();
+    if(currentUser?.role==='admin')refreshStats();
   };
 }
 
 // ---- Tabs ----
 function cTab(t){centerTab=t;document.querySelectorAll('#centerTabs .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tChat').style.display=t==='chat'?'flex':'none';$('tDetail').style.display=t==='detail'?'flex':'none';$('tSql').style.display=t==='sql'?'flex':'none';if(t==='chat')$('chatInput').focus()}
-function rTab(t){rightTab=t;document.querySelectorAll('.panel:last-child .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tUsers').style.display=t==='users'?'flex':'none';$('tStats').style.display=t==='stats'?'flex':'none'}
+function rTab(t){rightTab=t;document.querySelectorAll('.panel:last-child .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tUsers').style.display=t==='users'?'flex':'none';$('tStats').style.display=t==='stats'?'flex':'none';$('tAccounts').style.display=t==='accounts'?'flex':'none';if(t==='accounts')loadAccounts()}
 
 // ---- Chat ----
 async function sendChat(){
   if(sending)return;const inp=$('chatInput'),q=inp.value.trim();if(!q)return;
-  const model=$('modelSel').value,uid=$('chatUid').value||'admin';
+  const model=$('modelSel').value;
+  const uid=currentUser?.role==='admin'?($('chatUid').value||currentUser.username):currentUser.username;
   chatHistory.push({role:'user',content:q});renderChatMsgs();inp.value='';inp.style.height='auto';
   sending=true;$('chatSendBtn').disabled=true;
   const th=document.createElement('div');th.className='cthink';th.id='thinkInd';th.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';$('chatMessages').appendChild(th);scrollChat();
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,model,user_id:uid})});
+    const body={question:q,model};
+    if(currentUser?.role==='admin')body.user_id=uid;
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();$('thinkInd')?.remove();
     if(d.ok)chatHistory.push({role:'bot',content:d.answer,model:d.model,ms:d.duration_ms});
     else chatHistory.push({role:'error',content:d.error||'Unknown error'});
@@ -354,7 +477,8 @@ $('feedFilters').addEventListener('click',e=>{if(!e.target.classList.contains('f
 function selectEvent(id){selectedId=id;document.querySelectorAll('.fi').forEach(el=>el.classList.toggle('sel',el.dataset.id===id));renderDetail(id)}
 function renderDetail(id){
   const evt=events.find(e=>e.id===id);if(!evt)return;
-  const body=$('detailBody'),mb=$('modBar');mb.style.display='flex';
+  const body=$('detailBody'),mb=$('modBar');
+  if(currentUser?.role==='admin')mb.style.display='flex';
   const mod=moderation[id]||{};
   $('btnFlag').className='mbtn'+(mod.flagged?' fon':'');$('btnFlag').textContent=mod.flagged?'Unflag':'Flag';
   $('btnReview').className='mbtn'+(mod.reviewed?' ron':'');$('btnReview').textContent=mod.reviewed?'Reviewed':'Mark Reviewed';
@@ -384,6 +508,7 @@ function rtbl(rows){if(!rows.length)return'';const cols=Object.keys(rows[0]);let
 
 // ---- Users ----
 function renderUsers(){
+  if(currentUser?.role!=='admin')return;
   const body=$('usersBody'),list=Object.values(usersMap).sort((a,b)=>(b.last_seen||0)-(a.last_seen||0));
   const badge=$('usersBadge');const blocked=list.filter(u=>u.status==='blocked').length;
   if(blocked>0){badge.textContent=blocked;badge.classList.remove('hide');badge.classList.add('red')}else{badge.classList.add('hide')}
@@ -407,6 +532,7 @@ function showUserDetail(uid){
   const errs=uevts.filter(e=>e.type==='error').length;
   const queries=uevts.filter(e=>e.type==='query').length;
   const isBlocked=u.status==='blocked';
+  const priority=u.priority||'normal';
   const body=$('usersBody');
   body.innerHTML=`
     <div style="padding:4px">
@@ -422,10 +548,16 @@ function showUserDetail(uid){
           <div class="ustat-item">Last: <strong>${u.last_seen?timeAgo(u.last_seen):'?'}</strong></div>
         </div>
       </div>
-      <div style="display:flex;gap:8px;margin-bottom:10px">
+      <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
         ${isBlocked
           ?`<button class="ubtn unblock" onclick="userAction('${esc(uid)}','unblock')">Unblock User</button>`
           :`<button class="ubtn block" onclick="userAction('${esc(uid)}','block')">Block User</button>`}
+        <label style="font-size:10px;color:var(--text-dim);margin-left:8px">Priority</label>
+        <select style="padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:11px" onchange="setUserPriority('${esc(uid)}',this.value)">
+          <option value="high"${priority==='high'?' selected':''}>High</option>
+          <option value="normal"${priority==='normal'?' selected':''}>Normal</option>
+          <option value="low"${priority==='low'?' selected':''}>Low</option>
+        </select>
       </div>
       ${u.note?`<div class="ucard"><div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">ADMIN NOTE</div><div style="font-size:12px">${esc(u.note)}</div></div>`:''}
       <div class="stitle">Recent Activity</div>
@@ -436,10 +568,79 @@ function showUserDetail(uid){
 async function userAction(uid,action){
   await fetch(`/api/users/${uid}/${action}`,{method:'POST'});
 }
+async function setUserPriority(uid,priority){
+  await fetch(`/api/users/${uid}/update`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority})});
+  if(usersMap[uid])usersMap[uid].priority=priority;
+}
+
+// ---- Accounts ----
+async function loadAccounts(){
+  try{
+    const r=await fetch('/api/accounts');const d=await r.json();
+    renderAccounts(d.accounts||[]);
+  }catch(e){$('accountsBody').innerHTML='<div class="dempty">Error loading accounts</div>'}
+}
+function renderAccounts(accts){
+  const body=$('accountsBody');
+  if(!accts.length){body.innerHTML='<div class="dempty">No accounts</div>';return}
+  body.innerHTML=`
+    <div style="margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <div class="stitle" style="margin:0">Bot Control</div>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:auto">
+          <input type="checkbox" id="botToggle" onchange="toggleBot(this.checked)" ${appCfg.bot_enabled!==false?'checked':''}>
+          <span style="color:${appCfg.bot_enabled!==false?'var(--green)':'var(--red)'}" id="botLabel">${appCfg.bot_enabled!==false?'Bot Enabled':'Bot Disabled'}</span>
+        </label>
+      </div>
+    </div>
+    <div class="stitle">Dashboard Accounts</div>
+    ${accts.map(a=>`
+      <div class="ucard" style="padding:8px 10px;margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-weight:600;font-size:13px">${esc(a.username)}</span>
+          <span class="role-badge ${a.role}">${a.role}</span>
+          <span style="font-size:10px;color:var(--text-dim);margin-left:auto">priority: ${a.priority||'normal'}</span>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+          <select style="padding:2px 6px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:10px" onchange="setAccountRole('${esc(a.username)}',this.value)">
+            <option value="admin"${a.role==='admin'?' selected':''}>admin</option>
+            <option value="user"${a.role==='user'?' selected':''}>user</option>
+          </select>
+          <select style="padding:2px 6px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:10px" onchange="setAccountPriority('${esc(a.username)}',this.value)">
+            <option value="high"${a.priority==='high'?' selected':''}>high</option>
+            <option value="normal"${(a.priority||'normal')==='normal'?' selected':''}>normal</option>
+            <option value="low"${a.priority==='low'?' selected':''}>low</option>
+          </select>
+          ${a.username!==currentUser?.username?`<button class="mbtn" style="padding:2px 8px;font-size:10px;color:var(--red);margin-left:auto" onclick="deleteAccount('${esc(a.username)}')">Delete</button>`:''}
+        </div>
+      </div>
+    `).join('')}`;
+}
+async function toggleBot(enabled){
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bot_enabled:enabled})});
+  appCfg.bot_enabled=enabled;
+  const lbl=$('botLabel');if(lbl){lbl.textContent=enabled?'Bot Enabled':'Bot Disabled';lbl.style.color=enabled?'var(--green)':'var(--red)'}
+}
+async function setAccountRole(username,role){
+  await fetch(`/api/accounts/${username}/role`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role})});
+  loadAccounts();
+}
+async function setAccountPriority(username,priority){
+  await fetch(`/api/accounts/${username}/priority`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority})});
+  loadAccounts();
+}
+async function deleteAccount(username){
+  if(!confirm(`Delete account "${username}"?`))return;
+  const r=await fetch(`/api/accounts/${username}/delete`,{method:'POST'});
+  const d=await r.json();
+  if(d.error)alert(d.error);
+  loadAccounts();
+}
 
 // ---- Stats ----
 function refreshStats(){
-  fetch('/api/stats').then(r=>r.json()).then(s=>{
+  if(currentUser?.role!=='admin')return;
+  fetch('/api/stats').then(r=>{if(!r.ok)throw new Error();return r.json()}).then(s=>{
     renderStats(s);$('hUsers').textContent=s.active_users;$('hChats').textContent=s.total_chats;$('hErrors').textContent=s.total_errors;$('hAvg').textContent=s.avg_response_ms+'ms';
   }).catch(()=>{});
 }
@@ -468,9 +669,9 @@ function postMod(id,d){fetch(`/api/moderate/${id}`,{method:'POST',headers:{'Cont
 // ---- Settings ----
 function openSettings(){loadCfg();$('settingsModal').classList.add('open')}
 function closeSettings(){$('settingsModal').classList.remove('open')}
-async function loadCfg(){try{const r=await fetch('/api/config');const d=await r.json();appCfg=d.config;$('cfgUrl').value=appCfg.ollama_url||'http://localhost:11434';$('cfgPrompt').value=appCfg.system_prompt||'';$('cfgTemp').value=appCfg.temperature??0.7;await loadModels();$('cfgModel').value=appCfg.default_model||''}catch(e){}}
+async function loadCfg(){try{const r=await fetch('/api/config');if(!r.ok)return;const d=await r.json();appCfg=d.config;$('cfgUrl').value=appCfg.ollama_url||'http://localhost:11434';$('cfgPrompt').value=appCfg.system_prompt||'';$('cfgTemp').value=appCfg.temperature??0.7;await loadModels();$('cfgModel').value=appCfg.default_model||''}catch(e){}}
 async function saveSettings(){const c={ollama_url:$('cfgUrl').value,default_model:$('cfgModel').value,system_prompt:$('cfgPrompt').value,temperature:parseFloat($('cfgTemp').value)||0.7};await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});appCfg=c;closeSettings()}
-async function loadModels(){try{const r=await fetch('/api/models');ollamaModels=(await r.json()).models||[]}catch(e){ollamaModels=[]}populateModels()}
+async function loadModels(){try{const r=await fetch('/api/models');if(!r.ok)return;ollamaModels=(await r.json()).models||[]}catch(e){ollamaModels=[]}populateModels()}
 function populateModels(){[$('modelSel'),$('cfgModel')].forEach(s=>{if(!s)return;const c=s.value;s.innerHTML='';if(!ollamaModels.length){s.innerHTML='<option value="">No models found</option>';return}ollamaModels.forEach(m=>{const o=document.createElement('option');o.value=m.name;o.textContent=m.name;s.appendChild(o)});if(c&&ollamaModels.some(m=>m.name===c))s.value=c;else if(appCfg.default_model)s.value=appCfg.default_model})}
 function clearEvents(){if(!confirm('Clear all events? This cannot be undone.'))return;fetch('/api/clear',{method:'POST'})}
 
@@ -484,7 +685,7 @@ function timeAgo(ts){const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+'s 
 function hlSQL(sql){let r=esc(sql);r=r.replace(/('[^']*')/g,'<span class="ss">$1</span>');r=r.replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|IS|NULL|AS|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|INDEX|COUNT|SUM|AVG|MIN|MAX|DISTINCT|BETWEEN|LIKE|UNION|ALL|EXISTS|CASE|WHEN|THEN|ELSE|END|WITH)\b/gi,'<span class="sk">$1</span>');r=r.replace(/\b(\d+\.?\d*)\b/g,'<span class="sn">$1</span>');return r}
 
 // ---- Init ----
-connectSSE();loadCfg().then(()=>loadModels());setInterval(refreshStats,10000);setTimeout(refreshStats,500);
+checkAuth();
 </script>
 </body>
 </html>

@@ -4,11 +4,15 @@
 Receives events from the chatbot SDK, proxies chat requests to Ollama,
 manages users (block/allow), serves the admin dashboard, and pushes
 live updates via SSE.
+
+Features: cookie-based auth, admin/user roles, bot kill switch, user priorities.
 """
 
 import json
+import hashlib
 import os
 import re
+import secrets
 import sys
 import time
 import uuid
@@ -32,6 +36,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 CONFIG_FILE = DATA_DIR / "config.json"
 USERS_FILE = DATA_DIR / "users.json"
+ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 PUBLIC_DIR = Path(__file__).resolve().parent / "public"
 
 config = {
@@ -39,6 +44,7 @@ config = {
     "default_model": "llama3:8b",
     "system_prompt": "",
     "temperature": 0.7,
+    "bot_enabled": True,
 }
 config_lock = threading.Lock()
 
@@ -49,13 +55,22 @@ events: list[dict] = []
 events_lock = threading.Lock()
 moderation: dict[str, dict] = {}
 moderation_lock = threading.Lock()
-sse_clients: list[queue.Queue] = []
+sse_clients: list[tuple[queue.Queue, dict]] = []  # (queue, session_info)
 sse_lock = threading.Lock()
 
 # User management: user_id -> { status, first_seen, last_seen, ... }
 # status: "active" | "blocked" | "restricted"
 users: dict[str, dict] = {}
 users_lock = threading.Lock()
+
+# Account management: username -> { username, password_hash, salt, role, priority, created_at }
+accounts: dict[str, dict] = {}
+accounts_lock = threading.Lock()
+
+# Session management: session_id -> { username, role, created_at, expires_at }
+sessions: dict[str, dict] = {}
+sessions_lock = threading.Lock()
+SESSION_TTL = 86400  # 24 hours
 
 STOP_WORDS = frozenset(
     "der die das ein eine einer eines einem einen und oder aber wenn dann "
@@ -83,6 +98,106 @@ def extract_topics(text: str, top_n: int = 5) -> list[str]:
         if w not in STOP_WORDS:
             freq[w] += 1
     return [w for w, _ in sorted(freq.items(), key=lambda x: -x[1])[:top_n]]
+
+
+# ---------------------------------------------------------------------------
+# Password hashing
+# ---------------------------------------------------------------------------
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+
+def _verify_password(password: str, password_hash: str, salt: str) -> bool:
+    return secrets.compare_digest(_hash_password(password, salt), password_hash)
+
+
+# ---------------------------------------------------------------------------
+# Account persistence
+# ---------------------------------------------------------------------------
+def load_accounts():
+    global accounts
+    if ACCOUNTS_FILE.exists():
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                accounts = json.load(f)
+        except Exception:
+            pass
+
+
+def save_accounts():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with accounts_lock:
+            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+                json.dump(accounts, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[accounts] Error saving: {e}", file=sys.stderr)
+
+
+def ensure_default_admin():
+    with accounts_lock:
+        has_admin = any(a.get("role") == "admin" for a in accounts.values())
+    if not has_admin:
+        salt = secrets.token_hex(16)
+        with accounts_lock:
+            accounts["admin"] = {
+                "username": "admin",
+                "password_hash": _hash_password("admin", salt),
+                "salt": salt,
+                "role": "admin",
+                "priority": "normal",
+                "created_at": time.time(),
+            }
+        save_accounts()
+        print("[chatbot-monitor] Created default admin account (admin/admin)")
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+def create_session(username: str, role: str) -> str:
+    sid = secrets.token_hex(32)
+    now = time.time()
+    with sessions_lock:
+        sessions[sid] = {
+            "username": username,
+            "role": role,
+            "created_at": now,
+            "expires_at": now + SESSION_TTL,
+        }
+    return sid
+
+
+def get_session_by_id(sid: str) -> dict | None:
+    if not sid:
+        return None
+    with sessions_lock:
+        s = sessions.get(sid)
+    if s and s["expires_at"] > time.time():
+        return s
+    if s:
+        with sessions_lock:
+            sessions.pop(sid, None)
+    return None
+
+
+def delete_session(sid: str):
+    with sessions_lock:
+        sessions.pop(sid, None)
+
+
+def _cleanup_sessions_loop():
+    while True:
+        time.sleep(300)  # every 5 minutes
+        now = time.time()
+        with sessions_lock:
+            expired = [k for k, v in sessions.items() if v["expires_at"] <= now]
+            for k in expired:
+                del sessions[k]
+
+
+# Start background cleanup thread
+threading.Thread(target=_cleanup_sessions_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +261,7 @@ def touch_user(user_id: str):
                 "message_count": 0,
                 "error_count": 0,
                 "note": "",
+                "priority": "normal",
             }
         users[user_id]["last_seen"] = now
 
@@ -426,13 +542,14 @@ def broadcast_event(evt: dict):
     data = json.dumps(evt, ensure_ascii=False)
     dead = []
     with sse_lock:
-        for q in sse_clients:
+        for client_entry in sse_clients:
+            q = client_entry[0]
             try:
                 q.put_nowait(data)
             except queue.Full:
-                dead.append(q)
-        for q in dead:
-            sse_clients.remove(q)
+                dead.append(client_entry)
+        for item in dead:
+            sse_clients.remove(item)
 
 
 # ---------------------------------------------------------------------------
@@ -446,12 +563,15 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
 
-    def _send_json(self, data, status=200):
+    def _send_json(self, data, status=200, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        if headers:
+            for k, v in headers:
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -464,6 +584,36 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
+    # --- Auth helpers ---
+
+    def _get_session(self) -> tuple[dict | None, str]:
+        """Parse Cookie header, return (session_dict_or_None, session_id)."""
+        cookie = self.headers.get("Cookie", "")
+        sid = ""
+        for part in cookie.split(";"):
+            part = part.strip()
+            if part.startswith("session="):
+                sid = part[8:]
+                break
+        return get_session_by_id(sid), sid
+
+    def _require_auth(self, role: str = "user") -> dict | None:
+        """Returns session if authorized, sends 401/403 and returns None otherwise."""
+        session, _ = self._get_session()
+        if not session:
+            self._send_json({"error": "not_authenticated"}, 401)
+            return None
+        if role == "admin" and session.get("role") != "admin":
+            self._send_json({"error": "forbidden"}, 403)
+            return None
+        return session
+
+    def _session_cookie(self, sid: str) -> tuple[str, str]:
+        return ("Set-Cookie", f"session={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")
+
+    def _clear_cookie(self) -> tuple[str, str]:
+        return ("Set-Cookie", "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors_headers()
@@ -474,21 +624,131 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
 
+        # Public routes (no auth required)
         if path == "/event":
             return self._handle_post_event()
+        if path == "/api/auth/login":
+            return self._handle_login()
+        if path == "/api/auth/register":
+            return self._handle_register()
+        if path == "/api/auth/logout":
+            return self._handle_logout()
+
+        # User-level routes
         if path == "/api/chat":
-            return self._handle_chat()
+            session = self._require_auth("user")
+            if not session:
+                return
+            return self._handle_chat(session)
+
+        # Admin-level routes
         if path == "/api/clear":
+            session = self._require_auth("admin")
+            if not session:
+                return
             return self._handle_clear()
         if path == "/api/config":
+            session = self._require_auth("admin")
+            if not session:
+                return
             return self._handle_post_config()
         if path.startswith("/api/moderate/"):
+            session = self._require_auth("admin")
+            if not session:
+                return
             event_id = path.split("/api/moderate/", 1)[1]
             return self._handle_moderate(event_id)
+        if path.startswith("/api/accounts/"):
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_account_action(path)
         if path.startswith("/api/users/"):
+            session = self._require_auth("admin")
+            if not session:
+                return
             return self._handle_user_action(path)
 
         self._send_json({"error": "Not found"}, 404)
+
+    # --- Auth endpoint handlers ---
+
+    def _handle_login(self):
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+        if not username or not password:
+            self._send_json({"error": "username and password required"}, 400)
+            return
+
+        with accounts_lock:
+            acct = accounts.get(username)
+        if not acct or not _verify_password(password, acct["password_hash"], acct["salt"]):
+            self._send_json({"error": "invalid_credentials"}, 401)
+            return
+
+        sid = create_session(username, acct["role"])
+        self._send_json(
+            {"ok": True, "user": {"username": username, "role": acct["role"]}},
+            headers=[self._session_cookie(sid)],
+        )
+
+    def _handle_register(self):
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+        if not username or not password:
+            self._send_json({"error": "username and password required"}, 400)
+            return
+        if len(username) < 2:
+            self._send_json({"error": "username too short"}, 400)
+            return
+        if len(password) < 3:
+            self._send_json({"error": "password too short"}, 400)
+            return
+
+        with accounts_lock:
+            if username in accounts:
+                self._send_json({"error": "username_taken"}, 409)
+                return
+
+        salt = secrets.token_hex(16)
+        with accounts_lock:
+            accounts[username] = {
+                "username": username,
+                "password_hash": _hash_password(password, salt),
+                "salt": salt,
+                "role": "user",
+                "priority": "normal",
+                "created_at": time.time(),
+            }
+        save_accounts()
+
+        sid = create_session(username, "user")
+        self._send_json(
+            {"ok": True, "user": {"username": username, "role": "user"}},
+            headers=[self._session_cookie(sid)],
+        )
+
+    def _handle_logout(self):
+        session, sid = self._get_session()
+        if sid:
+            delete_session(sid)
+        self._send_json({"ok": True}, headers=[self._clear_cookie()])
+
+    # --- Event handlers ---
 
     def _handle_post_event(self):
         try:
@@ -496,6 +756,13 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             evt = json.loads(body)
         except (json.JSONDecodeError, Exception) as e:
             self._send_json({"error": str(e)}, 400)
+            return
+
+        # Check bot_enabled
+        with config_lock:
+            bot_on = config.get("bot_enabled", True)
+        if not bot_on:
+            self._send_json({"error": "bot_disabled"}, 503)
             return
 
         # Check if user is blocked
@@ -507,7 +774,14 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         evt = ingest_event(evt)
         self._send_json({"ok": True, "id": evt["id"]})
 
-    def _handle_chat(self):
+    def _handle_chat(self, session: dict):
+        # Check bot_enabled
+        with config_lock:
+            bot_on = config.get("bot_enabled", True)
+        if not bot_on:
+            self._send_json({"error": "bot_disabled"}, 503)
+            return
+
         try:
             body = self._read_body()
             data = json.loads(body)
@@ -520,7 +794,11 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "question is required"}, 400)
             return
 
-        user_id = data.get("user_id", "admin")
+        # Admin can override user_id; regular users use their session username
+        if session["role"] == "admin" and data.get("user_id"):
+            user_id = data["user_id"]
+        else:
+            user_id = session["username"]
 
         # Check if user is blocked
         if not is_user_allowed(user_id):
@@ -569,6 +847,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             for key in ("ollama_url", "default_model", "system_prompt", "temperature"):
                 if key in data:
                     config[key] = data[key]
+            if "bot_enabled" in data:
+                config["bot_enabled"] = bool(data["bot_enabled"])
         save_config()
         with config_lock:
             self._send_json({"ok": True, "config": dict(config)})
@@ -618,6 +898,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                         "user_id": user_id, "status": "blocked",
                         "first_seen": time.time(), "last_seen": time.time(),
                         "message_count": 0, "error_count": 0, "note": "",
+                        "priority": "normal",
                     }
             save_users()
             broadcast_event({"type": "_user_update", "user_id": user_id, "status": "blocked"})
@@ -644,9 +925,91 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                         users[user_id]["note"] = str(data["note"])
                     if "status" in data and data["status"] in ("active", "blocked", "restricted"):
                         users[user_id]["status"] = data["status"]
+                    if "priority" in data and data["priority"] in ("high", "normal", "low"):
+                        users[user_id]["priority"] = data["priority"]
             save_users()
             with users_lock:
                 self._send_json({"ok": True, "user": users.get(user_id, {})})
+
+        else:
+            self._send_json({"error": "Unknown action"}, 400)
+
+    def _handle_account_action(self, path: str):
+        """POST /api/accounts/<name>/role | priority | delete"""
+        parts = path.split("/api/accounts/", 1)[1].split("/")
+        if len(parts) < 2:
+            self._send_json({"error": "Invalid path"}, 400)
+            return
+
+        username = parts[0]
+        action = parts[1]
+
+        if action == "role":
+            try:
+                body = self._read_body()
+                data = json.loads(body)
+            except (json.JSONDecodeError, Exception) as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            new_role = data.get("role")
+            if new_role not in ("admin", "user"):
+                self._send_json({"error": "role must be admin or user"}, 400)
+                return
+            with accounts_lock:
+                if username not in accounts:
+                    self._send_json({"error": "account not found"}, 404)
+                    return
+                accounts[username]["role"] = new_role
+            save_accounts()
+            # Update any active sessions for this user
+            with sessions_lock:
+                for s in sessions.values():
+                    if s["username"] == username:
+                        s["role"] = new_role
+            self._send_json({"ok": True, "username": username, "role": new_role})
+
+        elif action == "priority":
+            try:
+                body = self._read_body()
+                data = json.loads(body)
+            except (json.JSONDecodeError, Exception) as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            priority = data.get("priority")
+            if priority not in ("high", "normal", "low"):
+                self._send_json({"error": "priority must be high, normal, or low"}, 400)
+                return
+            with accounts_lock:
+                if username not in accounts:
+                    self._send_json({"error": "account not found"}, 404)
+                    return
+                accounts[username]["priority"] = priority
+            save_accounts()
+            self._send_json({"ok": True, "username": username, "priority": priority})
+
+        elif action == "delete":
+            session, _ = self._get_session()
+            if session and session["username"] == username:
+                self._send_json({"error": "cannot delete own account"}, 400)
+                return
+            with accounts_lock:
+                if username not in accounts:
+                    self._send_json({"error": "account not found"}, 404)
+                    return
+                # Cannot delete last admin
+                if accounts[username]["role"] == "admin":
+                    admin_count = sum(1 for a in accounts.values() if a["role"] == "admin")
+                    if admin_count <= 1:
+                        self._send_json({"error": "cannot delete last admin"}, 400)
+                        return
+                del accounts[username]
+            save_accounts()
+            # Remove sessions for deleted user
+            with sessions_lock:
+                to_del = [k for k, v in sessions.items() if v["username"] == username]
+                for k in to_del:
+                    del sessions[k]
+            self._send_json({"ok": True, "username": username})
 
         else:
             self._send_json({"error": "Unknown action"}, 400)
@@ -658,30 +1021,21 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        if path == "/api/stream":
-            return self._handle_sse()
-        if path == "/api/events":
-            return self._handle_get_events(params)
-        if path == "/api/conversations":
-            return self._handle_conversations(params)
-        if path == "/api/stats":
-            return self._handle_stats()
-        if path == "/api/moderation":
-            return self._handle_get_moderation()
-        if path == "/api/models":
-            return self._handle_models()
-        if path == "/api/config":
-            return self._handle_get_config()
-        if path == "/api/users":
-            return self._handle_get_users()
-        if path.startswith("/api/users/") and path.count("/") == 3:
-            # GET /api/users/<id>
-            user_id = path.split("/api/users/", 1)[1].rstrip("/")
-            return self._handle_get_user(user_id)
+        # Public routes (no auth required)
+        if path == "/api/auth/me":
+            return self._handle_me()
         if path.startswith("/api/users/") and path.endswith("/check"):
             user_id = path.split("/api/users/", 1)[1].replace("/check", "")
             allowed = is_user_allowed(user_id)
-            return self._send_json({"user_id": user_id, "allowed": allowed})
+            with users_lock:
+                u = users.get(user_id, {})
+                priority = u.get("priority", "normal")
+            with config_lock:
+                bot_enabled = config.get("bot_enabled", True)
+            return self._send_json({
+                "user_id": user_id, "allowed": allowed,
+                "priority": priority, "bot_enabled": bot_enabled,
+            })
         if path == "/api/health":
             return self._send_json({
                 "status": "ok", "events": len(events),
@@ -689,7 +1043,72 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 "uptime_s": round(time.time() - SERVER_START),
             })
 
+        # SSE stream (user-level auth)
+        if path == "/api/stream":
+            session = self._require_auth("user")
+            if not session:
+                return
+            return self._handle_sse(session)
+
+        # User-level endpoints
+        if path == "/api/models":
+            session = self._require_auth("user")
+            if not session:
+                return
+            return self._handle_models()
+
+        # Admin-level endpoints
+        if path == "/api/events":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_get_events(params)
+        if path == "/api/conversations":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_conversations(params)
+        if path == "/api/stats":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_stats()
+        if path == "/api/moderation":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_get_moderation()
+        if path == "/api/config":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_get_config()
+        if path == "/api/users":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_get_users()
+        if path == "/api/accounts":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_get_accounts()
+        if path.startswith("/api/users/") and path.count("/") == 3:
+            session = self._require_auth("admin")
+            if not session:
+                return
+            user_id = path.split("/api/users/", 1)[1].rstrip("/")
+            return self._handle_get_user(user_id)
+
+        # Static files (public)
         self._serve_static(path)
+
+    def _handle_me(self):
+        session, _ = self._get_session()
+        if not session:
+            self._send_json({"error": "not_authenticated"}, 401)
+            return
+        self._send_json({"user": {"username": session["username"], "role": session["role"]}})
 
     def _serve_static(self, path: str):
         if path == "/" or path == "":
@@ -719,7 +1138,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _handle_sse(self):
+    def _handle_sse(self, session: dict):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -728,30 +1147,64 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self.end_headers()
 
         q: queue.Queue = queue.Queue(maxsize=500)
+        session_info = {"username": session["username"], "role": session["role"]}
+        client_entry = (q, session_info)
         with sse_lock:
-            sse_clients.append(q)
+            sse_clients.append(client_entry)
 
         try:
-            with events_lock:
-                init = list(events)
-            init_data = json.dumps(init, ensure_ascii=False)
-            self.wfile.write(f"event: init\ndata: {init_data}\n\n".encode())
+            # Send session info first
+            session_data = json.dumps(session_info, ensure_ascii=False)
+            self.wfile.write(f"event: session\ndata: {session_data}\n\n".encode())
             self.wfile.flush()
 
-            with moderation_lock:
-                mod_data = json.dumps(moderation, ensure_ascii=False)
-            self.wfile.write(f"event: moderation\ndata: {mod_data}\n\n".encode())
-            self.wfile.flush()
+            if session["role"] == "admin":
+                # Admin gets all events, moderation, and users
+                with events_lock:
+                    init = list(events)
+                init_data = json.dumps(init, ensure_ascii=False)
+                self.wfile.write(f"event: init\ndata: {init_data}\n\n".encode())
+                self.wfile.flush()
 
-            # Send users state
-            with users_lock:
-                users_data = json.dumps(users, ensure_ascii=False)
-            self.wfile.write(f"event: users\ndata: {users_data}\n\n".encode())
-            self.wfile.flush()
+                with moderation_lock:
+                    mod_data = json.dumps(moderation, ensure_ascii=False)
+                self.wfile.write(f"event: moderation\ndata: {mod_data}\n\n".encode())
+                self.wfile.flush()
+
+                with users_lock:
+                    users_data = json.dumps(users, ensure_ascii=False)
+                self.wfile.write(f"event: users\ndata: {users_data}\n\n".encode())
+                self.wfile.flush()
+            else:
+                # Non-admin users get only their own events + system events
+                username = session["username"]
+                with events_lock:
+                    user_events = [
+                        e for e in events
+                        if e.get("user_id") == username
+                        or e.get("type") in ("system", "_clear")
+                    ]
+                init_data = json.dumps(user_events, ensure_ascii=False)
+                self.wfile.write(f"event: init\ndata: {init_data}\n\n".encode())
+                self.wfile.flush()
 
             while True:
                 try:
                     data = q.get(timeout=15)
+                    # Filter for non-admin users
+                    if session["role"] != "admin":
+                        try:
+                            evt = json.loads(data)
+                            evt_type = evt.get("type", "")
+                            evt_uid = evt.get("user_id", "")
+                            # Skip admin-only internal events
+                            if evt_type.startswith("_") and evt_type != "_clear":
+                                continue
+                            # Skip other users' events
+                            if evt_uid and evt_uid != session["username"]:
+                                continue
+                        except json.JSONDecodeError:
+                            pass
                     self.wfile.write(f"data: {data}\n\n".encode())
                     self.wfile.flush()
                 except queue.Empty:
@@ -761,8 +1214,10 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             pass
         finally:
             with sse_lock:
-                if q in sse_clients:
-                    sse_clients.remove(q)
+                try:
+                    sse_clients.remove(client_entry)
+                except ValueError:
+                    pass
 
     def _handle_get_events(self, params: dict):
         type_filter = params.get("type", [None])[0]
@@ -842,6 +1297,18 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def _handle_get_user(self, user_id: str):
         self._send_json({"user": get_user_summary(user_id)})
 
+    def _handle_get_accounts(self):
+        with accounts_lock:
+            acct_list = []
+            for a in accounts.values():
+                acct_list.append({
+                    "username": a["username"],
+                    "role": a["role"],
+                    "priority": a.get("priority", "normal"),
+                    "created_at": a.get("created_at"),
+                })
+        self._send_json({"accounts": acct_list})
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -859,9 +1326,11 @@ def main():
     load_config()
     load_users()
     load_events()
+    load_accounts()
+    ensure_default_admin()
     rebuild_users_from_events()
     save_users()
-    print(f"[chatbot-monitor] Loaded {len(events)} events, {len(users)} users")
+    print(f"[chatbot-monitor] Loaded {len(events)} events, {len(users)} users, {len(accounts)} accounts")
     print(f"[chatbot-monitor] Ollama: {config['ollama_url']}  Model: {config['default_model']}")
 
     server = ThreadedHTTPServer(("0.0.0.0", PORT), MonitorHandler)
@@ -871,6 +1340,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[chatbot-monitor] Shutting down...")
         save_users()
+        save_accounts()
         server.shutdown()
 
 

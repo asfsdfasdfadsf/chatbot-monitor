@@ -89,6 +89,35 @@ def is_user_allowed(user_id: str) -> bool:
         return True  # fail-open: if monitor is down, allow the user
 
 
+def get_user_status(user_id: str) -> dict:
+    """Get full user status including allowed, priority, and bot_enabled.
+
+    Returns a dict with keys: allowed (bool), priority (str), bot_enabled (bool).
+    Returns fail-open defaults on any error so the chatbot keeps working.
+
+    Usage:
+        status = monitor.get_user_status("user123")
+        if not status["allowed"]:
+            return "You have been blocked."
+        if not status["bot_enabled"]:
+            return "Bot is currently disabled."
+    """
+    defaults = {"allowed": True, "priority": "normal", "bot_enabled": True}
+    if not _enabled:
+        return defaults
+    try:
+        req = Request(f"{_server_url}/api/users/{user_id}/check", method="GET")
+        resp = urlopen(req, timeout=2)
+        data = json.loads(resp.read())
+        return {
+            "allowed": data.get("allowed", True),
+            "priority": data.get("priority", "normal"),
+            "bot_enabled": data.get("bot_enabled", True),
+        }
+    except Exception:
+        return defaults  # fail-open
+
+
 # ---------------------------------------------------------------------------
 # Internal: fire-and-forget sender
 # ---------------------------------------------------------------------------

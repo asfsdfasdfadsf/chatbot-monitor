@@ -2,8 +2,8 @@
 """Comprehensive test suite for chatbot-monitor.
 
 Tests every endpoint, the SSE stream, the SDK, moderation, config,
-user management (block/unblock/permissions), and the full Ollama chat
-flow via a fake Ollama server.
+user management (block/unblock/permissions), authentication, roles,
+bot toggle, priorities, and the full Ollama chat flow via a fake Ollama server.
 """
 
 import json
@@ -18,6 +18,7 @@ from urllib.error import URLError, HTTPError
 BASE = "http://localhost:7779"
 PASS = 0
 FAIL = 0
+ADMIN_COOKIE = ""  # Set after login
 
 
 def test(name, condition, detail=""):
@@ -30,17 +31,92 @@ def test(name, condition, detail=""):
         print(f"  FAIL  {name}  {detail}")
 
 
-def get(path):
-    r = urlopen(f"{BASE}{path}", timeout=5)
+def login(username, password):
+    """Login and return the session cookie string, or empty string on failure."""
+    body = json.dumps({"username": username, "password": password}).encode()
+    req = Request(f"{BASE}/api/auth/login", data=body,
+                  headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        r = urlopen(req, timeout=5)
+        # Extract Set-Cookie header
+        cookie_header = r.headers.get("Set-Cookie", "")
+        # Parse "session=xxx; Path=/; ..."
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if part.startswith("session="):
+                return part  # "session=xxx"
+        return ""
+    except Exception:
+        return ""
+
+
+def get(path, cookie=None):
+    if cookie is None:
+        cookie = ADMIN_COOKIE
+    req = Request(f"{BASE}{path}")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    r = urlopen(req, timeout=5)
     return json.loads(r.read())
 
 
-def post(path, data):
+def post(path, data, cookie=None):
+    if cookie is None:
+        cookie = ADMIN_COOKIE
     body = json.dumps(data).encode()
     req = Request(f"{BASE}{path}", data=body,
                   headers={"Content-Type": "application/json"}, method="POST")
+    if cookie:
+        req.add_header("Cookie", cookie)
     r = urlopen(req, timeout=10)
     return json.loads(r.read())
+
+
+def post_raw(path, data, cookie=None):
+    """Like post() but returns the response object for header inspection."""
+    if cookie is None:
+        cookie = ADMIN_COOKIE
+    body = json.dumps(data).encode()
+    req = Request(f"{BASE}{path}", data=body,
+                  headers={"Content-Type": "application/json"}, method="POST")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    return urlopen(req, timeout=10)
+
+
+def get_raw(path, cookie=None):
+    """Like get() but returns the response object."""
+    if cookie is None:
+        cookie = ADMIN_COOKIE
+    req = Request(f"{BASE}{path}")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    return urlopen(req, timeout=5)
+
+
+def expect_error(method, path, data=None, expected_code=None, cookie=None):
+    """Make a request expecting an HTTP error. Returns (status_code, body_dict)."""
+    if cookie is None:
+        cookie = ADMIN_COOKIE
+    try:
+        if method == "GET":
+            req = Request(f"{BASE}{path}")
+        else:
+            body = json.dumps(data or {}).encode()
+            req = Request(f"{BASE}{path}", data=body,
+                          headers={"Content-Type": "application/json"}, method="POST")
+        if cookie:
+            req.add_header("Cookie", cookie)
+        r = urlopen(req, timeout=5)
+        return (r.status, json.loads(r.read()))
+    except HTTPError as e:
+        try:
+            body = json.loads(e.read())
+        except Exception:
+            body = {}
+        return (e.code, body)
+    except Exception as e:
+        return (0, {"error": str(e)})
 
 
 # =========================================================================
@@ -98,6 +174,8 @@ def start_fake_ollama():
 # Tests
 # =========================================================================
 def main():
+    global ADMIN_COOKIE
+
     print("=" * 60)
     print("  CHATBOT MONITOR — FULL TEST SUITE")
     print("=" * 60)
@@ -105,7 +183,7 @@ def main():
     # ---- Prerequisite: server must be running ----
     print("\n[1] Server connectivity")
     try:
-        h = get("/api/health")
+        h = get("/api/health", cookie="")
         test("Health endpoint reachable", h["status"] == "ok")
         test("Health returns event count", "events" in h)
         test("Health returns user count", "users" in h)
@@ -115,55 +193,144 @@ def main():
         print("  Start the server first: python server.py")
         sys.exit(1)
 
-    # ---- Clear any leftover data ----
-    print("\n[2] Clear events")
+    # ---- Authentication ----
+    print("\n[2] Authentication (login/register/logout/me)")
+
+    # Login as default admin
+    ADMIN_COOKIE = login("admin", "admin")
+    test("Admin login returns session cookie", len(ADMIN_COOKIE) > 10, f"got '{ADMIN_COOKIE}'")
+
+    # /api/auth/me with valid session
+    me = get("/api/auth/me")
+    test("GET /me returns username", me.get("user", {}).get("username") == "admin")
+    test("GET /me returns role=admin", me.get("user", {}).get("role") == "admin")
+
+    # /api/auth/me without cookie -> 401
+    code, _ = expect_error("GET", "/api/auth/me", cookie="")
+    test("GET /me without cookie returns 401", code == 401, f"got {code}")
+
+    # Invalid login
+    bad_cookie = login("admin", "wrongpassword")
+    test("Bad password returns empty cookie", bad_cookie == "")
+
+    bad_cookie2 = login("nonexistent", "pass")
+    test("Nonexistent user returns empty cookie", bad_cookie2 == "")
+
+    # Register a new user
+    resp = post_raw("/api/auth/register", {"username": "testuser", "password": "testpass"}, cookie="")
+    reg_data = json.loads(resp.read())
+    test("Register returns ok", reg_data.get("ok") is True)
+    test("Register returns user role", reg_data.get("user", {}).get("role") == "user")
+    reg_cookie_header = resp.headers.get("Set-Cookie", "")
+    user_cookie = ""
+    for part in reg_cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith("session="):
+            user_cookie = part
+            break
+    test("Register returns session cookie", len(user_cookie) > 10)
+
+    # /me as new user
+    me2 = get("/api/auth/me", cookie=user_cookie)
+    test("Registered user /me works", me2.get("user", {}).get("username") == "testuser")
+    test("Registered user role is user", me2.get("user", {}).get("role") == "user")
+
+    # Duplicate registration
+    code, body = expect_error("POST", "/api/auth/register",
+                              {"username": "testuser", "password": "other"}, cookie="")
+    test("Duplicate username rejected", code == 409, f"got {code}")
+
+    # Logout
+    post("/api/auth/logout", {}, cookie=user_cookie)
+    code, _ = expect_error("GET", "/api/auth/me", cookie=user_cookie)
+    test("After logout /me returns 401", code == 401, f"got {code}")
+
+    # Re-login as testuser for role tests
+    user_cookie = login("testuser", "testpass")
+    test("Re-login as testuser works", len(user_cookie) > 10)
+
+    # ---- Role-based access control ----
+    print("\n[3] Role-based access control")
+
+    # User can access /api/models (user-level)
+    models_r = get("/api/models", cookie=user_cookie)
+    test("User can access /api/models", "models" in models_r)
+
+    # User cannot access admin endpoints
+    code, _ = expect_error("GET", "/api/events?limit=10", cookie=user_cookie)
+    test("User cannot access /api/events", code == 403, f"got {code}")
+
+    code, _ = expect_error("GET", "/api/stats", cookie=user_cookie)
+    test("User cannot access /api/stats", code == 403, f"got {code}")
+
+    code, _ = expect_error("GET", "/api/users", cookie=user_cookie)
+    test("User cannot access /api/users", code == 403, f"got {code}")
+
+    code, _ = expect_error("POST", "/api/clear", {}, cookie=user_cookie)
+    test("User cannot access /api/clear", code == 403, f"got {code}")
+
+    code, _ = expect_error("GET", "/api/accounts", cookie=user_cookie)
+    test("User cannot access /api/accounts", code == 403, f"got {code}")
+
+    code, _ = expect_error("GET", "/api/config", cookie=user_cookie)
+    test("User cannot access /api/config", code == 403, f"got {code}")
+
+    code, _ = expect_error("GET", "/api/conversations", cookie=user_cookie)
+    test("User cannot access /api/conversations", code == 403, f"got {code}")
+
+    # No cookie at all -> 401
+    code, _ = expect_error("GET", "/api/events?limit=10", cookie="")
+    test("No cookie -> 401 on protected endpoints", code == 401, f"got {code}")
+
+    # ---- Clear events (as admin) ----
+    print("\n[4] Clear events")
     r = post("/api/clear", {})
     test("Clear returns ok", r.get("ok") is True)
-    h = get("/api/health")
+    h = get("/api/health", cookie="")
     test("Events are 0 after clear", h["events"] == 0)
 
     # ---- Event ingestion ----
-    print("\n[3] Event ingestion (POST /event)")
+    print("\n[5] Event ingestion (POST /event)")
     evt1 = post("/event", {
         "type": "chat", "user_id": "user-A",
         "question": "Was kostet Artikel 4711?",
         "answer": "Artikel 4711 kostet 29,90 EUR.",
         "duration_ms": 1200, "model": "llama3:8b",
-    })
+    }, cookie="")  # SDK endpoint, no auth needed
     test("Chat event accepted", evt1.get("ok") is True)
     test("Chat event has ID", len(evt1.get("id", "")) > 0)
 
     evt2 = post("/event", {
         "type": "query", "sql": "SELECT price FROM articles WHERE id=4711",
         "results": [{"price": 29.90}], "duration_ms": 8, "user_id": "user-A",
-    })
+    }, cookie="")
     test("Query event accepted", evt2.get("ok") is True)
 
     evt3 = post("/event", {
         "type": "error", "message": "Connection timeout",
         "error_type": "llm_timeout", "user_id": "user-B",
         "details": "requests.exceptions.ConnectTimeout",
-    })
+    }, cookie="")
     test("Error event accepted", evt3.get("ok") is True)
 
     evt4 = post("/event", {
         "type": "system", "action": "startup",
         "message": "Chatbot v2.1 started",
-    })
+    }, cookie="")
     test("System event accepted", evt4.get("ok") is True)
 
     # Auto-assigned fields
-    evt5 = post("/event", {"type": "chat", "question": "No ID test", "answer": "ok"})
+    evt5 = post("/event", {"type": "chat", "question": "No ID test", "answer": "ok"}, cookie="")
     test("Auto-assigns ID", len(evt5.get("id", "")) > 0)
 
-    evt6 = post("/event", {})
+    evt6 = post("/event", {}, cookie="")
     test("Missing type defaults to system", evt6.get("ok") is True)
 
-    h = get("/api/health")
+    h = get("/api/health", cookie="")
     test("All 6 events stored", h["events"] == 6, f"got {h['events']}")
 
     # ---- GET /api/events with filters ----
-    print("\n[4] Event queries (GET /api/events)")
+    print("\n[6] Event queries (GET /api/events)")
     all_evts = get("/api/events?limit=100")
     test("Returns total count", all_evts["total"] == 6, f"got {all_evts['total']}")
     test("Returns events array", len(all_evts["events"]) == 6)
@@ -178,7 +345,7 @@ def main():
     test("Pagination (limit+offset)", len(limited["events"]) == 2)
 
     # ---- Conversations ----
-    print("\n[5] Conversations (GET /api/conversations)")
+    print("\n[7] Conversations (GET /api/conversations)")
     convos = get("/api/conversations")
     test("Returns conversations", len(convos["conversations"]) > 0)
     user_a_convo = next((c for c in convos["conversations"] if c["user_id"] == "user-A"), None)
@@ -186,7 +353,7 @@ def main():
     test("User-A has 1 chat message", user_a_convo["message_count"] == 1 if user_a_convo else False)
 
     # ---- Stats ----
-    print("\n[6] Stats (GET /api/stats)")
+    print("\n[8] Stats (GET /api/stats)")
     s = get("/api/stats")
     test("Returns total_events", s["total_events"] == 6, f"got {s['total_events']}")
     test("Returns total_chats", s["total_chats"] == 2)
@@ -202,7 +369,7 @@ def main():
     test("Returns type_counts", "chat" in s["type_counts"])
 
     # ---- Moderation ----
-    print("\n[7] Moderation")
+    print("\n[9] Moderation")
     chat_id = evt1["id"]
 
     # Flag
@@ -237,7 +404,7 @@ def main():
     test("Unflag works", m4["moderation"]["flagged"] is False)
 
     # ---- Config ----
-    print("\n[8] Config (GET/POST /api/config)")
+    print("\n[10] Config (GET/POST /api/config)")
     cfg = get("/api/config")
     test("Config returns ollama_url", "ollama_url" in cfg["config"])
     test("Config returns default_model", "default_model" in cfg["config"])
@@ -260,7 +427,7 @@ def main():
     test("Config persists across reads", cfg2["config"]["system_prompt"] == "Du bist ein Test-Assistent.")
 
     # ---- Fake Ollama + Chat ----
-    print("\n[9] Chat via Ollama (POST /api/chat)")
+    print("\n[11] Chat via Ollama (POST /api/chat)")
     print("     Starting fake Ollama on :11434...")
     fake_server = start_fake_ollama()
     time.sleep(0.3)
@@ -271,8 +438,8 @@ def main():
     test("llama3:8b in model list", any(m["name"] == "llama3:8b" for m in models["models"]))
     test("mistral:7b in model list", any(m["name"] == "mistral:7b" for m in models["models"]))
 
-    # Test actual chat
-    pre_count = get("/api/health")["events"]
+    # Test actual chat (as admin, can set user_id)
+    pre_count = get("/api/health", cookie="")["events"]
     chat_r = post("/api/chat", {
         "question": "Wie viele Schrauben M8 sind auf Lager?",
         "model": "llama3:8b",
@@ -283,7 +450,7 @@ def main():
     test("Chat returns duration_ms", chat_r.get("duration_ms", 0) > 0, f"got {chat_r.get('duration_ms')}")
     test("Chat returns model", chat_r.get("model") == "llama3:8b")
 
-    post_count = get("/api/health")["events"]
+    post_count = get("/api/health", cookie="")["events"]
     test("Chat event was logged", post_count == pre_count + 1, f"pre={pre_count} post={post_count}")
 
     # Test chat with different model
@@ -303,42 +470,36 @@ def main():
     test("Chat uses default model from config", chat_r3.get("ok") is True)
 
     # Test chat without question (should fail)
-    try:
-        req = Request(f"{BASE}/api/chat",
-                      data=json.dumps({"user_id": "x"}).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-        r = urlopen(req, timeout=5)
-        data = json.loads(r.read())
-        test("Empty question rejected", False, "should have returned 400")
-    except Exception as e:
-        test("Empty question rejected", "400" in str(e) or "HTTP Error" in str(e))
+    code, _ = expect_error("POST", "/api/chat", {"user_id": "x"})
+    test("Empty question rejected", code == 400, f"got {code}")
+
+    # Test user-role chat (user_id comes from session)
+    user_cookie = login("testuser", "testpass")
+    chat_user = post("/api/chat", {
+        "question": "User role chat test",
+    }, cookie=user_cookie)
+    test("User-role chat works", chat_user.get("ok") is True)
 
     # Test blocked user cannot chat via /api/chat
-    # First block a user, then try to chat
     post("/api/users/blocked-chatter/block", {})
-    try:
-        req = Request(f"{BASE}/api/chat",
-                      data=json.dumps({"question": "Hello", "user_id": "blocked-chatter"}).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-        r = urlopen(req, timeout=5)
-        data = json.loads(r.read())
-        test("Blocked user rejected from /api/chat", False, "should have returned 403")
-    except HTTPError as e:
-        test("Blocked user rejected from /api/chat", e.code == 403, f"got {e.code}")
-    except Exception as e:
-        test("Blocked user rejected from /api/chat", "403" in str(e), str(e))
+    # Need to create a dashboard account for blocked-chatter to test chat blocking
+    # Actually, the chat endpoint uses session username, so let's test by blocking the
+    # chatbot end-user that gets created when admin chats as "blocked-chatter"
+    code, _ = expect_error("POST", "/api/chat",
+                           {"question": "Hello", "user_id": "blocked-chatter"})
+    test("Blocked user rejected from /api/chat", code == 403, f"got {code}")
     # Unblock for cleanup
     post("/api/users/blocked-chatter/unblock", {})
 
     fake_server.shutdown()
 
     # ---- SDK test ----
-    print("\n[10] SDK (monitor.py)")
+    print("\n[12] SDK (monitor.py)")
     sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
     import monitor
     monitor.init(BASE)
 
-    count_pre = get("/api/health")["events"]
+    count_pre = get("/api/health", cookie="")["events"]
 
     monitor.chat("sdk-user", "SDK question?", "SDK answer!", duration_ms=100, model="test")
     monitor.query("SELECT 1", results=[{"x": 1}], duration_ms=5, user_id="sdk-user")
@@ -346,7 +507,7 @@ def main():
     monitor.system("test", "SDK system event")
     time.sleep(1)  # Wait for background threads
 
-    count_post = get("/api/health")["events"]
+    count_post = get("/api/health", cookie="")["events"]
     test("SDK sent 4 events", count_post == count_pre + 4, f"pre={count_pre} post={count_post}")
 
     # Test SDK short names
@@ -357,11 +518,11 @@ def main():
     monitor.log_system("alias action")
     time.sleep(1)
 
-    count_post2 = get("/api/health")["events"]
+    count_post2 = get("/api/health", cookie="")["events"]
     test("SDK aliases work", count_post2 == count_pre2 + 4, f"pre={count_pre2} post={count_post2}")
 
     # ---- User Management ----
-    print("\n[11] User management")
+    print("\n[13] User management")
 
     # Users should have been auto-registered from events above
     users_r = get("/api/users")
@@ -380,8 +541,8 @@ def main():
          f"got {user_detail['user'].get('total_chats')}")
     test("User detail has recent_events", isinstance(user_detail["user"]["recent_events"], list))
 
-    # Check user permission (active user)
-    check_a = get("/api/users/user-A/check")
+    # Check user permission (active user) — no auth needed (SDK endpoint)
+    check_a = get("/api/users/user-A/check", cookie="")
     test("Active user is allowed", check_a["allowed"] is True)
 
     # Block a user
@@ -390,25 +551,16 @@ def main():
     test("Block returns status=blocked", block_r.get("status") == "blocked")
 
     # Check blocked user permission
-    check_b = get("/api/users/user-B/check")
+    check_b = get("/api/users/user-B/check", cookie="")
     test("Blocked user is not allowed", check_b["allowed"] is False)
 
     # Blocked user's event should be rejected (403)
-    try:
-        req = Request(f"{BASE}/event",
-                      data=json.dumps({"type": "chat", "user_id": "user-B",
-                                       "question": "blocked", "answer": "nope"}).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-        r = urlopen(req, timeout=5)
-        data = json.loads(r.read())
-        test("Blocked user event rejected", False, "should have returned 403")
-    except HTTPError as e:
-        body = json.loads(e.read())
-        test("Blocked user event rejected", e.code == 403, f"got {e.code}")
-        test("Rejection says user_blocked", body.get("error") == "user_blocked")
-    except Exception as e:
-        test("Blocked user event rejected", "403" in str(e), str(e))
-        test("Rejection says user_blocked", False, "could not parse")
+    code, body = expect_error("POST", "/event",
+                              {"type": "chat", "user_id": "user-B",
+                               "question": "blocked", "answer": "nope"},
+                              cookie="")
+    test("Blocked user event rejected", code == 403, f"got {code}")
+    test("Rejection says user_blocked", body.get("error") == "user_blocked")
 
     # Unblock the user
     unblock_r = post("/api/users/user-B/unblock", {})
@@ -416,14 +568,14 @@ def main():
     test("Unblock returns status=active", unblock_r.get("status") == "active")
 
     # Check unblocked user is now allowed
-    check_b2 = get("/api/users/user-B/check")
+    check_b2 = get("/api/users/user-B/check", cookie="")
     test("Unblocked user is allowed again", check_b2["allowed"] is True)
 
     # Unblocked user's event should now be accepted
     evt_unblocked = post("/event", {
         "type": "chat", "user_id": "user-B",
         "question": "I'm back!", "answer": "Welcome back!",
-    })
+    }, cookie="")
     test("Unblocked user event accepted", evt_unblocked.get("ok") is True)
 
     # Update user note
@@ -434,7 +586,7 @@ def main():
     # Block a new unknown user (auto-creates)
     block_new = post("/api/users/brand-new-user/block", {})
     test("Block new user auto-creates", block_new.get("ok") is True)
-    check_new = get("/api/users/brand-new-user/check")
+    check_new = get("/api/users/brand-new-user/check", cookie="")
     test("Newly blocked user is not allowed", check_new["allowed"] is False)
     # Unblock for cleanup
     post("/api/users/brand-new-user/unblock", {})
@@ -444,16 +596,129 @@ def main():
     test("Stats has total_users", s2["total_users"] >= 2)
     test("Stats has blocked_users", "blocked_users" in s2)
 
-    # SDK is_user_allowed
-    print("\n[12] SDK is_user_allowed")
+    # ---- SDK is_user_allowed ----
+    print("\n[14] SDK is_user_allowed")
     test("SDK: active user allowed", monitor.is_user_allowed("user-A") is True)
     post("/api/users/sdk-block-test/block", {})
     test("SDK: blocked user not allowed", monitor.is_user_allowed("sdk-block-test") is False)
     post("/api/users/sdk-block-test/unblock", {})
     test("SDK: unblocked user allowed", monitor.is_user_allowed("sdk-block-test") is True)
 
+    # ---- SDK get_user_status ----
+    print("\n[15] SDK get_user_status")
+    status = monitor.get_user_status("user-A")
+    test("get_user_status returns allowed", status["allowed"] is True)
+    test("get_user_status returns priority", status["priority"] in ("high", "normal", "low"))
+    test("get_user_status returns bot_enabled", isinstance(status["bot_enabled"], bool))
+
+    # ---- Priority ----
+    print("\n[16] User priority")
+    # Set priority on chatbot end-user
+    pr = post("/api/users/user-A/update", {"priority": "high"})
+    test("Set user priority returns ok", pr.get("ok") is True)
+    test("Priority saved", pr.get("user", {}).get("priority") == "high")
+
+    # Verify via /check endpoint
+    check_pr = get("/api/users/user-A/check", cookie="")
+    test("/check returns priority", check_pr.get("priority") == "high")
+    test("/check returns bot_enabled", "bot_enabled" in check_pr)
+
+    # Reset priority
+    post("/api/users/user-A/update", {"priority": "normal"})
+
+    # ---- Bot toggle ----
+    print("\n[17] Bot toggle (bot_enabled)")
+    # Disable bot
+    cfg_off = post("/api/config", {"bot_enabled": False})
+    test("Bot disabled via config", cfg_off.get("ok") is True)
+    test("Config shows bot_enabled=false", cfg_off["config"].get("bot_enabled") is False)
+
+    # SDK /event should return 503
+    code, body = expect_error("POST", "/event",
+                              {"type": "chat", "user_id": "user-A",
+                               "question": "hello", "answer": "world"},
+                              cookie="")
+    test("POST /event returns 503 when bot disabled", code == 503, f"got {code}")
+
+    # /api/chat should return 503
+    # Need fake ollama for this — just check the error code
+    code, _ = expect_error("POST", "/api/chat",
+                           {"question": "test", "user_id": "admin-test"})
+    test("POST /api/chat returns 503 when bot disabled", code == 503, f"got {code}")
+
+    # /check should report bot_enabled=false
+    check_bot = get("/api/users/user-A/check", cookie="")
+    test("/check shows bot_enabled=false", check_bot.get("bot_enabled") is False)
+
+    # SDK get_user_status should reflect it
+    status_off = monitor.get_user_status("user-A")
+    test("SDK get_user_status shows bot_enabled=false", status_off["bot_enabled"] is False)
+
+    # Re-enable bot
+    cfg_on = post("/api/config", {"bot_enabled": True})
+    test("Bot re-enabled", cfg_on["config"].get("bot_enabled") is True)
+
+    # Verify event ingestion works again
+    evt_after = post("/event", {
+        "type": "system", "action": "bot_re_enabled",
+    }, cookie="")
+    test("Events accepted after bot re-enabled", evt_after.get("ok") is True)
+
+    # ---- Account management ----
+    print("\n[18] Account management")
+
+    # List accounts
+    accts = get("/api/accounts")
+    test("GET /api/accounts returns list", "accounts" in accts)
+    test("Admin account exists", any(a["username"] == "admin" for a in accts["accounts"]))
+    test("testuser account exists", any(a["username"] == "testuser" for a in accts["accounts"]))
+    # Passwords should NOT be in the response
+    admin_acct = next(a for a in accts["accounts"] if a["username"] == "admin")
+    test("No password_hash in response", "password_hash" not in admin_acct)
+    test("No salt in response", "salt" not in admin_acct)
+
+    # Change role
+    role_r = post("/api/accounts/testuser/role", {"role": "admin"})
+    test("Change role returns ok", role_r.get("ok") is True)
+
+    # Verify role changed
+    accts2 = get("/api/accounts")
+    tu = next(a for a in accts2["accounts"] if a["username"] == "testuser")
+    test("Role changed to admin", tu["role"] == "admin")
+
+    # Change back to user
+    post("/api/accounts/testuser/role", {"role": "user"})
+
+    # Set account priority
+    pri_r = post("/api/accounts/testuser/priority", {"priority": "high"})
+    test("Set account priority returns ok", pri_r.get("ok") is True)
+
+    accts3 = get("/api/accounts")
+    tu2 = next(a for a in accts3["accounts"] if a["username"] == "testuser")
+    test("Account priority set to high", tu2["priority"] == "high")
+
+    # Reset
+    post("/api/accounts/testuser/priority", {"priority": "normal"})
+
+    # Cannot delete self
+    code, body = expect_error("POST", "/api/accounts/admin/delete", {})
+    test("Cannot delete own account", code in (400, 403), f"got {code}")
+
+    # Register another user to test deletion
+    post("/api/auth/register", {"username": "deleteme", "password": "deleteme"}, cookie="")
+    del_r = post("/api/accounts/deleteme/delete", {})
+    test("Delete account returns ok", del_r.get("ok") is True)
+
+    # Verify deleted
+    accts4 = get("/api/accounts")
+    test("Deleted account gone", not any(a["username"] == "deleteme" for a in accts4["accounts"]))
+
+    # Deleted user cannot login
+    dead_cookie = login("deleteme", "deleteme")
+    test("Deleted user cannot login", dead_cookie == "")
+
     # ---- Users persistence ----
-    print("\n[13] Users persistence")
+    print("\n[19] Users persistence")
     from pathlib import Path
     users_file = Path(__file__).parent / "data" / "users.json"
     test("Users file exists", users_file.exists())
@@ -462,8 +727,7 @@ def main():
         test("Users file has data", len(users_data) >= 2, f"got {len(users_data)} users")
 
     # ---- Persistence ----
-    print("\n[14] JSONL persistence")
-    from pathlib import Path
+    print("\n[20] JSONL persistence")
     jsonl = Path(__file__).parent / "data" / "events.jsonl"
     lines = jsonl.read_text(encoding="utf-8").strip().split("\n")
     test("JSONL file has events", len(lines) >= 10, f"got {len(lines)} lines")
@@ -479,36 +743,50 @@ def main():
         cfg_data = json.loads(cfg_file.read_text())
         test("Config file has correct data", cfg_data.get("system_prompt") == "Du bist ein Test-Assistent.")
 
+    # ---- Accounts persistence ----
+    accounts_file = Path(__file__).parent / "data" / "accounts.json"
+    test("Accounts file exists", accounts_file.exists())
+    if accounts_file.exists():
+        acct_data = json.loads(accounts_file.read_text())
+        test("Accounts file has admin", "admin" in acct_data)
+
     # ---- SSE ----
-    print("\n[15] SSE stream (GET /api/stream)")
+    print("\n[21] SSE stream (GET /api/stream)")
     import urllib.request
     req = urllib.request.Request(f"{BASE}/api/stream")
+    req.add_header("Cookie", ADMIN_COOKIE)
     resp = urllib.request.urlopen(req, timeout=5)
-    chunk = resp.read(200).decode()
+    chunk = resp.read(500).decode()
+    test("SSE returns event: session", "event: session" in chunk)
     test("SSE returns event: init", "event: init" in chunk)
     test("SSE returns data payload", "data:" in chunk)
     resp.close()
 
     # ---- Static files ----
-    print("\n[16] Static file serving")
+    print("\n[22] Static file serving")
     req = urllib.request.Request(f"{BASE}/")
     resp = urllib.request.urlopen(req, timeout=5)
     html = resp.read().decode()
     test("Dashboard HTML served", "WaWi Chatbot Monitor" in html)
+    test("Dashboard has login screen", "loginScreen" in html)
     test("Dashboard has chat input", "chatInput" in html)
     test("Dashboard has model select", "modelSel" in html)
     test("Dashboard has settings modal", "settingsModal" in html)
     test("Dashboard has clear button", "clearEvents" in html)
     test("Dashboard has users panel", "usersBody" in html)
     test("Dashboard has user management", "userAction" in html)
+    test("Dashboard has accounts tab", "tAccounts" in html)
     resp.close()
 
     # ---- Final clear ----
-    print("\n[17] Final cleanup")
+    print("\n[23] Final cleanup")
     r = post("/api/clear", {})
     test("Final clear works", r.get("ok") is True)
-    h = get("/api/health")
+    h = get("/api/health", cookie="")
     test("Events back to 0", h["events"] == 0)
+
+    # Clean up testuser account
+    post("/api/accounts/testuser/delete", {})
 
     # ---- Summary ----
     print("\n" + "=" * 60)
