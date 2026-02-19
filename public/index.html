@@ -23,9 +23,7 @@
     --error-color: #f85149;
     --system-color: #8b949e;
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   body {
     background: var(--bg);
     color: var(--text);
@@ -35,55 +33,51 @@
     overflow: hidden;
   }
 
-  /* Layout */
-  .app {
-    display: grid;
-    grid-template-rows: 42px 1fr;
-    height: 100vh;
-  }
+  .app { display: grid; grid-template-rows: 42px 1fr; height: 100vh; }
 
+  /* Header */
   .header {
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
     padding: 0 16px;
-    gap: 16px;
+    gap: 12px;
   }
-
-  .header h1 {
-    font-size: 14px;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-
+  .header h1 { font-size: 14px; font-weight: 600; white-space: nowrap; }
   .header h1 span { color: var(--accent); }
-
   .header-stats {
     display: flex;
-    gap: 16px;
+    gap: 14px;
     margin-left: auto;
     font-size: 12px;
     color: var(--text-dim);
   }
-
   .header-stats .stat-val { color: var(--text); font-weight: 600; }
-
+  .header-btn {
+    padding: 3px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .header-btn:hover { border-color: var(--text-dim); color: var(--text); }
+  .header-btn.danger:hover { border-color: var(--red); color: var(--red); }
   .connection-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--red);
-    transition: background 0.3s;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red); transition: background 0.3s;
   }
   .connection-dot.connected { background: var(--green); }
 
+  /* Panels */
   .panels {
     display: grid;
-    grid-template-columns: 300px 1fr 1fr 280px;
+    grid-template-columns: 280px 1fr 1fr 260px;
     overflow: hidden;
   }
-
   .panel {
     border-right: 1px solid var(--border);
     display: flex;
@@ -91,7 +85,6 @@
     overflow: hidden;
   }
   .panel:last-child { border-right: none; }
-
   .panel-header {
     padding: 8px 12px;
     background: var(--surface);
@@ -106,18 +99,36 @@
     gap: 8px;
     flex-shrink: 0;
   }
-
   .panel-body {
     flex: 1;
     overflow-y: auto;
     padding: 8px;
   }
-
   .panel-body::-webkit-scrollbar { width: 6px; }
   .panel-body::-webkit-scrollbar-track { background: transparent; }
   .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-  /* Feed panel */
+  /* Tabs */
+  .tab-bar {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    background: var(--surface);
+  }
+  .tab-btn {
+    padding: 6px 14px;
+    border: none;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 12px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Feed */
   .feed-filters {
     display: flex;
     gap: 4px;
@@ -126,7 +137,6 @@
     flex-wrap: wrap;
     flex-shrink: 0;
   }
-
   .filter-btn {
     padding: 2px 8px;
     border-radius: 10px;
@@ -140,7 +150,6 @@
   .filter-btn:hover { border-color: var(--text-dim); }
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .filter-btn.active-red { background: var(--red); color: #fff; border-color: var(--red); }
-
   .feed-item {
     padding: 8px 10px;
     border-radius: 6px;
@@ -152,85 +161,163 @@
   .feed-item:hover { background: var(--surface2); }
   .feed-item.selected { background: var(--surface2); border-left-color: var(--accent); }
   .feed-item.flagged { border-left-color: var(--red); }
-
   .feed-item .feed-type {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-    margin-bottom: 2px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.3px; margin-bottom: 2px;
   }
   .feed-item .feed-type.chat { color: var(--chat-color); }
   .feed-item .feed-type.query { color: var(--query-color); }
   .feed-item .feed-type.error { color: var(--error-color); }
   .feed-item .feed-type.system { color: var(--system-color); }
-
   .feed-item .feed-preview {
-    color: var(--text-dim);
-    font-size: 12px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    color: var(--text-dim); font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-
   .feed-item .feed-meta {
-    display: flex;
-    gap: 8px;
-    font-size: 10px;
-    color: var(--text-dim);
-    margin-top: 2px;
+    display: flex; gap: 8px; font-size: 10px; color: var(--text-dim); margin-top: 2px;
   }
-
   .feed-item .flag-icon { color: var(--red); }
 
-  /* Chat detail panel */
-  .detail-empty {
+  /* Chat panel */
+  .chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
     display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 100%;
-    color: var(--text-dim);
-    font-size: 13px;
+    flex-direction: column;
+    gap: 8px;
   }
-
+  .chat-messages::-webkit-scrollbar { width: 6px; }
+  .chat-messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .chat-empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--text-dim); font-size: 13px;
+    flex-direction: column; gap: 8px;
+  }
+  .chat-empty .chat-empty-hint { font-size: 11px; color: var(--text-dim); opacity: 0.6; }
   .chat-bubble {
     padding: 10px 14px;
     border-radius: 12px;
-    margin-bottom: 8px;
-    max-width: 90%;
+    max-width: 85%;
     line-height: 1.5;
     font-size: 13px;
     word-wrap: break-word;
     white-space: pre-wrap;
   }
-
   .chat-bubble.question {
     background: #1f3a5f;
     border: 1px solid #264a78;
-    margin-left: auto;
+    align-self: flex-end;
     border-bottom-right-radius: 4px;
   }
-
   .chat-bubble.answer {
     background: var(--surface2);
     border: 1px solid var(--border);
+    align-self: flex-start;
     border-bottom-left-radius: 4px;
   }
-
   .chat-bubble .bubble-label {
-    font-size: 10px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    margin-bottom: 4px; color: var(--text-dim);
+  }
+  .chat-bubble .bubble-meta {
+    font-size: 10px; color: var(--text-dim); margin-top: 4px;
+    display: flex; gap: 8px;
+  }
+  .chat-input-area {
+    padding: 10px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .chat-input-row {
+    display: flex;
+    gap: 6px;
+    align-items: flex-end;
+  }
+  .chat-input {
+    flex: 1;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+    resize: none;
+    min-height: 38px;
+    max-height: 120px;
+  }
+  .chat-input:focus { border-color: var(--accent); }
+  .chat-input::placeholder { color: var(--text-dim); }
+  .chat-send {
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
     font-weight: 600;
-    text-transform: uppercase;
-    margin-bottom: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+    min-height: 38px;
+  }
+  .chat-send:hover { opacity: 0.85; }
+  .chat-send:disabled { opacity: 0.4; cursor: not-allowed; }
+  .chat-config {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    align-items: center;
+  }
+  .chat-config select, .chat-config input {
+    padding: 3px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 11px;
+    outline: none;
+  }
+  .chat-config select:focus, .chat-config input:focus { border-color: var(--accent); }
+  .chat-config label {
+    font-size: 10px;
     color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .chat-thinking {
+    align-self: flex-start;
+    padding: 10px 14px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    border-bottom-left-radius: 4px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .dot-pulse { display: inline-flex; gap: 4px; }
+  .dot-pulse span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim);
+    animation: pulse 1.4s infinite both;
+  }
+  .dot-pulse span:nth-child(2) { animation-delay: 0.2s; }
+  .dot-pulse span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes pulse {
+    0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
   }
 
+  /* Detail view */
+  .detail-empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--text-dim); font-size: 13px;
+  }
   .badge {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 8px;
-    font-size: 10px;
-    font-weight: 600;
+    display: inline-block; padding: 1px 6px; border-radius: 8px;
+    font-size: 10px; font-weight: 600;
   }
   .badge-model { background: #1c3a2a; color: var(--green); }
   .badge-time { background: #1a2332; color: var(--accent); }
@@ -239,300 +326,167 @@
   .badge-slow { background: #2a1515; color: var(--red); }
   .badge-error { background: #2a1515; color: var(--red); }
   .badge-user { background: #1a2332; color: var(--cyan); }
-
   .detail-meta {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-    padding: 0 4px;
+    display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; padding: 0 4px;
   }
-
   .moderation-bar {
-    display: flex;
-    gap: 6px;
-    padding: 8px;
-    border-top: 1px solid var(--border);
-    flex-shrink: 0;
+    display: flex; gap: 6px; padding: 8px;
+    border-top: 1px solid var(--border); flex-shrink: 0;
   }
-
   .mod-btn {
-    padding: 4px 12px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text-dim);
-    font-size: 11px;
-    cursor: pointer;
+    padding: 4px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface);
+    color: var(--text-dim); font-size: 11px; cursor: pointer;
     transition: all 0.15s;
   }
   .mod-btn:hover { border-color: var(--text-dim); color: var(--text); }
   .mod-btn.flag-active { background: #2a1515; border-color: var(--red); color: var(--red); }
   .mod-btn.review-active { background: #1c3a2a; border-color: var(--green); color: var(--green); }
-
   .note-input {
-    flex: 1;
-    padding: 4px 8px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--surface2);
-    color: var(--text);
-    font-size: 11px;
-    outline: none;
+    flex: 1; padding: 4px 8px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface2);
+    color: var(--text); font-size: 11px; outline: none;
   }
   .note-input:focus { border-color: var(--accent); }
 
-  /* SQL inspector panel */
+  /* SQL panel */
   .sql-block {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px;
-    margin-bottom: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; margin-bottom: 8px;
     font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-    font-size: 12px;
-    white-space: pre-wrap;
-    word-break: break-all;
+    font-size: 12px; white-space: pre-wrap; word-break: break-all;
   }
-
   .sql-keyword { color: var(--purple); font-weight: 600; }
   .sql-string { color: var(--green); }
   .sql-number { color: var(--orange); }
-
-  .result-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 11px;
-    margin-top: 6px;
-  }
+  .result-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
   .result-table th {
-    background: var(--surface);
-    padding: 4px 8px;
-    text-align: left;
-    border: 1px solid var(--border);
-    color: var(--accent);
-    font-weight: 600;
-    position: sticky;
-    top: 0;
+    background: var(--surface); padding: 4px 8px; text-align: left;
+    border: 1px solid var(--border); color: var(--accent); font-weight: 600;
   }
   .result-table td {
-    padding: 3px 8px;
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    max-width: 200px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    padding: 3px 8px; border: 1px solid var(--border); color: var(--text-dim);
+    max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .result-table tr:hover td { background: var(--surface2); }
-
   .query-error {
-    background: #2a1515;
-    border: 1px solid var(--red);
-    border-radius: 6px;
-    padding: 8px 10px;
-    color: var(--red);
-    font-size: 12px;
-    margin-top: 6px;
+    background: #2a1515; border: 1px solid var(--red); border-radius: 6px;
+    padding: 8px 10px; color: var(--red); font-size: 12px; margin-top: 6px;
   }
 
-  /* Stats panel */
+  /* Stats */
   .stat-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    margin-bottom: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
   }
-
   .stat-card .stat-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-dim);
-    margin-bottom: 4px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--text-dim); margin-bottom: 4px;
   }
-
-  .stat-card .stat-value {
-    font-size: 22px;
-    font-weight: 700;
-  }
-
-  .stat-card .stat-sub {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 2px;
-  }
-
-  .stat-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-bottom: 8px;
-  }
-
+  .stat-card .stat-value { font-size: 22px; font-weight: 700; }
+  .stat-card .stat-sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
   .stat-grid .stat-card { margin-bottom: 0; }
   .stat-grid .stat-card .stat-value { font-size: 18px; }
-
-  /* Hourly bar chart */
-  .bar-chart {
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
-    height: 60px;
-    padding: 4px 0;
-  }
-
+  .bar-chart { display: flex; align-items: flex-end; gap: 2px; height: 60px; padding: 4px 0; }
   .bar {
-    flex: 1;
-    background: var(--accent);
-    border-radius: 2px 2px 0 0;
-    min-height: 2px;
-    position: relative;
-    opacity: 0.7;
-    transition: opacity 0.15s;
+    flex: 1; background: var(--accent); border-radius: 2px 2px 0 0;
+    min-height: 2px; position: relative; opacity: 0.7; transition: opacity 0.15s;
   }
   .bar:hover { opacity: 1; }
   .bar:hover::after {
-    content: attr(data-label);
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--surface);
-    border: 1px solid var(--border);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 10px;
-    white-space: nowrap;
-    color: var(--text);
-    z-index: 10;
+    content: attr(data-label); position: absolute; bottom: 100%; left: 50%;
+    transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border);
+    padding: 2px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap;
+    color: var(--text); z-index: 10;
   }
-
-  /* Topics */
-  .topic-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-
+  .topic-list { display: flex; flex-wrap: wrap; gap: 4px; }
   .topic-tag {
-    padding: 2px 8px;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 11px;
-    color: var(--text-dim);
+    padding: 2px 8px; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 10px; font-size: 11px; color: var(--text-dim);
   }
-
-  /* Moderation queue */
   .mod-queue-item {
-    padding: 6px 8px;
-    border-radius: 6px;
-    margin-bottom: 4px;
-    cursor: pointer;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    transition: background 0.1s;
+    padding: 6px 8px; border-radius: 6px; margin-bottom: 4px; cursor: pointer;
+    background: var(--surface); border: 1px solid var(--border); transition: background 0.1s;
   }
   .mod-queue-item:hover { background: var(--surface2); }
-
-  .mod-queue-item .mod-q-type {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-  }
-
+  .mod-queue-item .mod-q-type { font-size: 10px; font-weight: 600; text-transform: uppercase; }
   .mod-queue-item .mod-q-preview {
-    font-size: 11px;
-    color: var(--text-dim);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 11px; color: var(--text-dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-
-  /* Error detail */
-  .error-detail {
-    background: #1a0f0f;
-    border: 1px solid var(--red);
-    border-radius: 8px;
-    padding: 12px;
-  }
-
-  .error-detail .error-type {
-    color: var(--red);
-    font-weight: 600;
-    font-size: 14px;
-    margin-bottom: 6px;
-  }
-
-  .error-detail .error-msg {
-    color: var(--text);
-    font-size: 13px;
-    line-height: 1.5;
-  }
-
+  .error-detail { background: #1a0f0f; border: 1px solid var(--red); border-radius: 8px; padding: 12px; }
+  .error-detail .error-type { color: var(--red); font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+  .error-detail .error-msg { color: var(--text); font-size: 13px; line-height: 1.5; }
   .error-detail .error-details {
-    margin-top: 8px;
-    padding: 8px;
-    background: var(--surface);
-    border-radius: 6px;
-    font-family: monospace;
-    font-size: 12px;
-    color: var(--text-dim);
-    white-space: pre-wrap;
+    margin-top: 8px; padding: 8px; background: var(--surface); border-radius: 6px;
+    font-family: monospace; font-size: 12px; color: var(--text-dim); white-space: pre-wrap;
   }
-
-  /* System detail */
-  .system-detail {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-  }
-
-  .system-detail .system-action {
-    color: var(--text);
-    font-weight: 600;
-    font-size: 14px;
-    margin-bottom: 6px;
-  }
-
+  .system-detail { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .system-detail .system-action { color: var(--text); font-weight: 600; font-size: 14px; margin-bottom: 6px; }
   .section-title {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-dim);
-    margin: 12px 0 6px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-dim); margin: 12px 0 6px;
   }
 
-  /* Responsive - narrow screens */
+  /* Settings panel overlay */
+  .settings-overlay {
+    display: none;
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.5); z-index: 100;
+    align-items: center; justify-content: center;
+  }
+  .settings-overlay.open { display: flex; }
+  .settings-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; width: 420px; max-width: 90vw;
+  }
+  .settings-box h2 { font-size: 15px; margin-bottom: 14px; }
+  .settings-field { margin-bottom: 12px; }
+  .settings-field label {
+    display: block; font-size: 11px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 4px;
+  }
+  .settings-field input, .settings-field textarea, .settings-field select {
+    width: 100%; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface2);
+    color: var(--text); font-size: 12px; font-family: inherit; outline: none;
+  }
+  .settings-field textarea { min-height: 60px; resize: vertical; }
+  .settings-field input:focus, .settings-field textarea:focus { border-color: var(--accent); }
+  .settings-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  .settings-actions button {
+    padding: 6px 16px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text-dim); font-size: 12px;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .settings-actions button:hover { color: var(--text); border-color: var(--text-dim); }
+  .settings-actions button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  /* Responsive */
   @media (max-width: 1200px) {
-    .panels {
-      grid-template-columns: 250px 1fr 280px;
-    }
+    .panels { grid-template-columns: 240px 1fr 240px; }
     .panel.sql-panel { display: none; }
   }
 </style>
 </head>
 <body>
 <div class="app">
-  <!-- Header -->
   <div class="header">
     <h1><span>WaWi</span> Chatbot Monitor</h1>
-    <div class="header-stats" id="headerStats">
+    <div class="header-stats">
       <span>Users: <span class="stat-val" id="hActiveUsers">0</span></span>
       <span>Chats: <span class="stat-val" id="hTotalChats">0</span></span>
       <span>Errors: <span class="stat-val" id="hTotalErrors">0</span></span>
       <span>Avg: <span class="stat-val" id="hAvgResponse">0ms</span></span>
     </div>
+    <button class="header-btn" onclick="openSettings()">Settings</button>
+    <button class="header-btn danger" onclick="clearEvents()">Clear All</button>
     <div class="connection-dot" id="connDot" title="Disconnected"></div>
   </div>
 
-  <!-- Panels -->
   <div class="panels">
-    <!-- 1. Live Feed -->
+    <!-- 1. Feed -->
     <div class="panel feed-panel">
       <div class="panel-header">
         Live Feed
@@ -548,17 +502,48 @@
       <div class="panel-body" id="feedBody"></div>
     </div>
 
-    <!-- 2. Chat Detail -->
-    <div class="panel detail-panel">
-      <div class="panel-header" id="detailHeader">Detail</div>
-      <div class="panel-body" id="detailBody">
-        <div class="detail-empty">Select an event from the feed</div>
+    <!-- 2. Chat + Detail (tabbed) -->
+    <div class="panel center-panel">
+      <div class="tab-bar">
+        <button class="tab-btn active" data-tab="chat" onclick="switchTab('chat')">Chat</button>
+        <button class="tab-btn" data-tab="detail" onclick="switchTab('detail')">Detail</button>
       </div>
-      <div class="moderation-bar" id="modBar" style="display:none;">
-        <button class="mod-btn" id="btnFlag" onclick="toggleFlag()">Flag</button>
-        <button class="mod-btn" id="btnReview" onclick="toggleReview()">Reviewed</button>
-        <input class="note-input" id="noteInput" placeholder="Add note..." onkeydown="if(event.key==='Enter')saveNote()">
-        <button class="mod-btn" onclick="saveNote()">Save</button>
+
+      <!-- Chat tab -->
+      <div id="chatTab" style="display:flex; flex-direction:column; flex:1; overflow:hidden;">
+        <div class="chat-messages" id="chatMessages">
+          <div class="chat-empty">
+            <div>Ask the chatbot anything</div>
+            <div class="chat-empty-hint">Messages are sent to your local Ollama instance</div>
+          </div>
+        </div>
+        <div class="chat-input-area">
+          <div class="chat-input-row">
+            <textarea class="chat-input" id="chatInput" rows="1"
+              placeholder="Type a message..."
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}"></textarea>
+            <button class="chat-send" id="chatSendBtn" onclick="sendChat()">Send</button>
+          </div>
+          <div class="chat-config">
+            <label>Model</label>
+            <select id="modelSelect"><option>loading...</option></select>
+            <label style="margin-left:8px">User</label>
+            <input id="chatUserId" value="admin" style="width:80px">
+          </div>
+        </div>
+      </div>
+
+      <!-- Detail tab -->
+      <div id="detailTab" style="display:none; flex-direction:column; flex:1; overflow:hidden;">
+        <div class="panel-body" id="detailBody">
+          <div class="detail-empty">Select an event from the feed</div>
+        </div>
+        <div class="moderation-bar" id="modBar" style="display:none;">
+          <button class="mod-btn" id="btnFlag" onclick="toggleFlag()">Flag</button>
+          <button class="mod-btn" id="btnReview" onclick="toggleReview()">Reviewed</button>
+          <input class="note-input" id="noteInput" placeholder="Add note..." onkeydown="if(event.key==='Enter')saveNote()">
+          <button class="mod-btn" onclick="saveNote()">Save</button>
+        </div>
       </div>
     </div>
 
@@ -573,10 +558,37 @@
       </div>
     </div>
 
-    <!-- 4. Stats + Moderation -->
+    <!-- 4. Stats -->
     <div class="panel stats-panel">
       <div class="panel-header">Stats &amp; Moderation</div>
       <div class="panel-body" id="statsBody"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="settings-overlay" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
+  <div class="settings-box">
+    <h2>Chatbot Settings</h2>
+    <div class="settings-field">
+      <label>Ollama URL</label>
+      <input id="cfgOllamaUrl" value="http://localhost:11434">
+    </div>
+    <div class="settings-field">
+      <label>Default Model</label>
+      <select id="cfgModel"><option>loading...</option></select>
+    </div>
+    <div class="settings-field">
+      <label>System Prompt</label>
+      <textarea id="cfgSystemPrompt" placeholder="e.g. Du bist ein WaWi-Assistent. Antworte auf Deutsch."></textarea>
+    </div>
+    <div class="settings-field">
+      <label>Temperature</label>
+      <input id="cfgTemperature" type="number" min="0" max="2" step="0.1" value="0.7">
+    </div>
+    <div class="settings-actions">
+      <button onclick="closeSettings()">Cancel</button>
+      <button class="primary" onclick="saveSettings()">Save</button>
     </div>
   </div>
 </div>
@@ -586,15 +598,19 @@
 // State
 // =========================================================================
 let events = [];
-let moderation = {};  // event_id -> {flagged, reviewed, note}
+let moderation = {};
 let selectedId = null;
 let activeFilter = 'all';
-let autoFollow = true;
+let activeTab = 'chat';
 let connected = false;
 let stats = {};
+let chatHistory = [];  // admin chat messages for the chat tab
+let sending = false;
+let ollamaModels = [];
+let appConfig = {};
 
 // =========================================================================
-// SSE Connection
+// SSE
 // =========================================================================
 function connectSSE() {
   const es = new EventSource('/api/stream');
@@ -605,34 +621,37 @@ function connectSSE() {
     dot.className = 'connection-dot connected';
     dot.title = 'Connected';
   };
-
   es.onerror = () => {
     connected = false;
     dot.className = 'connection-dot';
     dot.title = 'Disconnected - reconnecting...';
   };
-
-  // Initial batch
   es.addEventListener('init', (e) => {
-    const data = JSON.parse(e.data);
-    events = data;
+    events = JSON.parse(e.data);
     renderFeed();
     renderSqlPanel();
     refreshStats();
   });
-
-  // Initial moderation state
   es.addEventListener('moderation', (e) => {
     moderation = JSON.parse(e.data);
     renderFeed();
     if (selectedId) renderDetail(selectedId);
   });
-
-  // Live events
   es.onmessage = (e) => {
     const evt = JSON.parse(e.data);
-
-    // Moderation update
+    if (evt.type === '_clear') {
+      events = [];
+      moderation = {};
+      selectedId = null;
+      renderFeed();
+      renderSqlPanel();
+      refreshStats();
+      if (activeTab === 'detail') {
+        document.getElementById('detailBody').innerHTML = '<div class="detail-empty">Select an event from the feed</div>';
+        document.getElementById('modBar').style.display = 'none';
+      }
+      return;
+    }
     if (evt.type === '_moderation_update') {
       moderation[evt.event_id] = evt.moderation;
       renderFeed();
@@ -640,18 +659,137 @@ function connectSSE() {
       refreshStats();
       return;
     }
-
     events.push(evt);
     if (events.length > 5000) events.shift();
-
     addFeedItem(evt);
     if (evt.type === 'query') addSqlItem(evt);
-    if (autoFollow && !selectedId) {
-      scrollFeedToBottom();
-    }
     refreshStats();
   };
 }
+
+// =========================================================================
+// Tabs
+// =========================================================================
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.getElementById('chatTab').style.display = tab === 'chat' ? 'flex' : 'none';
+  document.getElementById('detailTab').style.display = tab === 'detail' ? 'flex' : 'none';
+  if (tab === 'chat') document.getElementById('chatInput').focus();
+}
+
+// =========================================================================
+// Admin Chat
+// =========================================================================
+async function sendChat() {
+  if (sending) return;
+  const input = document.getElementById('chatInput');
+  const question = input.value.trim();
+  if (!question) return;
+
+  const model = document.getElementById('modelSelect').value;
+  const userId = document.getElementById('chatUserId').value || 'admin';
+
+  // Add user bubble
+  chatHistory.push({ role: 'user', content: question });
+  renderChatMessages();
+  input.value = '';
+  input.style.height = 'auto';
+
+  // Show thinking indicator
+  sending = true;
+  document.getElementById('chatSendBtn').disabled = true;
+  const thinkingEl = document.createElement('div');
+  thinkingEl.className = 'chat-thinking';
+  thinkingEl.id = 'thinkingIndicator';
+  thinkingEl.innerHTML = '<div class="dot-pulse"><span></span><span></span><span></span></div>';
+  document.getElementById('chatMessages').appendChild(thinkingEl);
+  scrollChatToBottom();
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, model, user_id: userId }),
+    });
+    const data = await resp.json();
+
+    // Remove thinking
+    const ti = document.getElementById('thinkingIndicator');
+    if (ti) ti.remove();
+
+    if (data.ok) {
+      chatHistory.push({
+        role: 'bot',
+        content: data.answer,
+        model: data.model,
+        duration_ms: data.duration_ms,
+      });
+    } else {
+      chatHistory.push({
+        role: 'error',
+        content: data.error || 'Unknown error',
+      });
+    }
+  } catch (err) {
+    const ti = document.getElementById('thinkingIndicator');
+    if (ti) ti.remove();
+    chatHistory.push({ role: 'error', content: err.message });
+  }
+
+  sending = false;
+  document.getElementById('chatSendBtn').disabled = false;
+  renderChatMessages();
+  document.getElementById('chatInput').focus();
+}
+
+function renderChatMessages() {
+  const container = document.getElementById('chatMessages');
+  if (chatHistory.length === 0) {
+    container.innerHTML = `
+      <div class="chat-empty">
+        <div>Ask the chatbot anything</div>
+        <div class="chat-empty-hint">Messages are sent to your local Ollama instance</div>
+      </div>`;
+    return;
+  }
+
+  container.innerHTML = chatHistory.map(msg => {
+    if (msg.role === 'user') {
+      return `<div class="chat-bubble question">
+        <div class="bubble-label">You</div>
+        ${escHtml(msg.content)}
+      </div>`;
+    }
+    if (msg.role === 'error') {
+      return `<div class="chat-bubble answer" style="border-color:var(--red)">
+        <div class="bubble-label" style="color:var(--red)">Error</div>
+        ${escHtml(msg.content)}
+      </div>`;
+    }
+    return `<div class="chat-bubble answer">
+      <div class="bubble-label">Bot</div>
+      ${escHtml(msg.content)}
+      <div class="bubble-meta">
+        ${msg.model ? `<span>${escHtml(msg.model)}</span>` : ''}
+        ${msg.duration_ms ? `<span>${formatDuration(msg.duration_ms)}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  scrollChatToBottom();
+}
+
+function scrollChatToBottom() {
+  const c = document.getElementById('chatMessages');
+  c.scrollTop = c.scrollHeight;
+}
+
+// Auto-resize textarea
+document.getElementById('chatInput').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
 
 // =========================================================================
 // Feed
@@ -666,13 +804,13 @@ function renderFeed() {
 }
 
 function getFilteredEvents() {
-  if (activeFilter === 'all') return events.filter(e => e.type !== '_moderation_update');
+  if (activeFilter === 'all') return events.filter(e => !e.type.startsWith('_'));
   if (activeFilter === 'flagged') return events.filter(e => moderation[e.id]?.flagged);
   return events.filter(e => e.type === activeFilter);
 }
 
 function addFeedItem(evt, scroll = true) {
-  if (evt.type === '_moderation_update') return;
+  if (evt.type.startsWith('_')) return;
   if (activeFilter !== 'all') {
     if (activeFilter === 'flagged') {
       if (!moderation[evt.id]?.flagged) return;
@@ -683,21 +821,23 @@ function addFeedItem(evt, scroll = true) {
   const div = document.createElement('div');
   div.className = 'feed-item' + (evt.id === selectedId ? ' selected' : '') + (moderation[evt.id]?.flagged ? ' flagged' : '');
   div.dataset.id = evt.id;
-  div.onclick = () => selectEvent(evt.id);
+  div.onclick = () => {
+    selectEvent(evt.id);
+    switchTab('detail');
+  };
 
   const preview = getPreview(evt);
-  const time = formatTime(evt.timestamp);
+  const ts = formatTime(evt.timestamp);
   const flag = moderation[evt.id]?.flagged ? ' <span class="flag-icon">&#9873;</span>' : '';
 
   div.innerHTML = `
     <div class="feed-type ${evt.type}">${evt.type}${flag}</div>
     <div class="feed-preview">${escHtml(preview)}</div>
     <div class="feed-meta">
-      <span>${time}</span>
+      <span>${ts}</span>
       ${evt.user_id ? `<span>${escHtml(evt.user_id)}</span>` : ''}
       ${evt.duration_ms ? `<span>${evt.duration_ms}ms</span>` : ''}
-    </div>
-  `;
+    </div>`;
 
   body.appendChild(div);
   document.getElementById('feedCount').textContent = body.children.length;
@@ -732,17 +872,13 @@ document.getElementById('feedFilters').addEventListener('click', (e) => {
 });
 
 // =========================================================================
-// Detail panel
+// Detail
 // =========================================================================
 function selectEvent(id) {
   selectedId = id;
-  autoFollow = false;
-
-  // Highlight feed item
   document.querySelectorAll('.feed-item').forEach(el => {
     el.classList.toggle('selected', el.dataset.id === id);
   });
-
   renderDetail(id);
 }
 
@@ -750,19 +886,15 @@ function renderDetail(id) {
   const evt = events.find(e => e.id === id);
   if (!evt) return;
 
-  const header = document.getElementById('detailHeader');
   const body = document.getElementById('detailBody');
   const modBar = document.getElementById('modBar');
-
-  header.textContent = evt.type.toUpperCase() + ' Detail';
   modBar.style.display = 'flex';
 
-  // Update moderation buttons
   const mod = moderation[id] || {};
   document.getElementById('btnFlag').className = 'mod-btn' + (mod.flagged ? ' flag-active' : '');
   document.getElementById('btnFlag').textContent = mod.flagged ? 'Unflag' : 'Flag';
   document.getElementById('btnReview').className = 'mod-btn' + (mod.reviewed ? ' review-active' : '');
-  document.getElementById('btnReview').textContent = mod.reviewed ? 'Reviewed ✓' : 'Mark Reviewed';
+  document.getElementById('btnReview').textContent = mod.reviewed ? 'Reviewed' : 'Mark Reviewed';
   document.getElementById('noteInput').value = mod.note || '';
 
   switch (evt.type) {
@@ -775,48 +907,37 @@ function renderDetail(id) {
 }
 
 function renderChatDetail(body, evt) {
-  const timeBadge = getTimeBadge(evt.duration_ms);
+  const tb = getTimeBadge(evt.duration_ms);
   body.innerHTML = `
     <div class="detail-meta">
       ${evt.model ? `<span class="badge badge-model">${escHtml(evt.model)}</span>` : ''}
-      ${evt.duration_ms ? `<span class="badge ${timeBadge.cls}">${evt.duration_ms}ms</span>` : ''}
+      ${evt.duration_ms ? `<span class="badge ${tb.cls}">${evt.duration_ms}ms</span>` : ''}
       ${evt.user_id ? `<span class="badge badge-user">${escHtml(evt.user_id)}</span>` : ''}
       <span class="badge badge-time">${formatTime(evt.timestamp)}</span>
     </div>
-    <div class="chat-bubble question">
-      <div class="bubble-label">User</div>
-      ${escHtml(evt.question || '')}
+    <div class="chat-bubble question" style="max-width:100%">
+      <div class="bubble-label">User</div>${escHtml(evt.question || '')}
     </div>
-    <div class="chat-bubble answer">
-      <div class="bubble-label">Bot</div>
-      ${escHtml(evt.answer || '')}
+    <div class="chat-bubble answer" style="max-width:100%">
+      <div class="bubble-label">Bot</div>${escHtml(evt.answer || '')}
     </div>
-    ${evt.metadata ? `<div class="section-title">Metadata</div><pre style="color:var(--text-dim);font-size:11px">${escHtml(JSON.stringify(evt.metadata, null, 2))}</pre>` : ''}
-  `;
+    ${evt.metadata ? `<div class="section-title">Metadata</div><pre style="color:var(--text-dim);font-size:11px">${escHtml(JSON.stringify(evt.metadata,null,2))}</pre>` : ''}`;
 }
 
 function renderQueryDetail(body, evt) {
-  const timeBadge = getTimeBadge(evt.duration_ms);
+  const tb = getTimeBadge(evt.duration_ms);
   let html = `
     <div class="detail-meta">
-      ${evt.duration_ms != null ? `<span class="badge ${timeBadge.cls}">${evt.duration_ms}ms</span>` : ''}
+      ${evt.duration_ms != null ? `<span class="badge ${tb.cls}">${evt.duration_ms}ms</span>` : ''}
       ${evt.user_id ? `<span class="badge badge-user">${escHtml(evt.user_id)}</span>` : ''}
       <span class="badge badge-time">${formatTime(evt.timestamp)}</span>
     </div>
-    <div class="sql-block">${highlightSQL(evt.sql || '')}</div>
-  `;
-
-  if (evt.error) {
-    html += `<div class="query-error">${escHtml(evt.error)}</div>`;
-  }
-
-  if (evt.results && Array.isArray(evt.results) && evt.results.length > 0) {
+    <div class="sql-block">${highlightSQL(evt.sql || '')}</div>`;
+  if (evt.error) html += `<div class="query-error">${escHtml(evt.error)}</div>`;
+  if (evt.results?.length > 0) {
     html += renderResultTable(evt.results);
-    if (evt.results_truncated) {
-      html += `<div style="font-size:11px;color:var(--orange);margin-top:4px">Showing ${evt.results.length} of ${evt.results_total} rows (truncated)</div>`;
-    }
+    if (evt.results_truncated) html += `<div style="font-size:11px;color:var(--orange);margin-top:4px">Showing ${evt.results.length} of ${evt.results_total} rows</div>`;
   }
-
   body.innerHTML = html;
 }
 
@@ -831,37 +952,29 @@ function renderErrorDetail(body, evt) {
       <div class="error-type">${escHtml(evt.error_type || 'Error')}</div>
       <div class="error-msg">${escHtml(evt.message || '')}</div>
       ${evt.details ? `<div class="error-details">${escHtml(evt.details)}</div>` : ''}
-    </div>
-    ${evt.metadata ? `<div class="section-title">Metadata</div><pre style="color:var(--text-dim);font-size:11px">${escHtml(JSON.stringify(evt.metadata, null, 2))}</pre>` : ''}
-  `;
+    </div>`;
 }
 
 function renderSystemDetail(body, evt) {
   body.innerHTML = `
-    <div class="detail-meta">
-      <span class="badge badge-time">${formatTime(evt.timestamp)}</span>
-    </div>
+    <div class="detail-meta"><span class="badge badge-time">${formatTime(evt.timestamp)}</span></div>
     <div class="system-detail">
       <div class="system-action">${escHtml(evt.action || 'system')}</div>
       <div style="color:var(--text-dim);margin-top:4px">${escHtml(evt.message || '')}</div>
-    </div>
-    ${evt.metadata ? `<div class="section-title">Metadata</div><pre style="color:var(--text-dim);font-size:11px">${escHtml(JSON.stringify(evt.metadata, null, 2))}</pre>` : ''}
-  `;
+    </div>`;
 }
 
 // =========================================================================
-// SQL Inspector Panel
+// SQL Panel
 // =========================================================================
 function renderSqlPanel() {
   const body = document.getElementById('sqlBody');
   const queries = events.filter(e => e.type === 'query');
   document.getElementById('queryCount').textContent = queries.length;
-
   if (queries.length === 0) {
     body.innerHTML = '<div class="detail-empty">SQL queries will appear here</div>';
     return;
   }
-
   body.innerHTML = '';
   queries.slice(-50).forEach(evt => addSqlItem(evt, false));
   body.scrollTop = body.scrollHeight;
@@ -870,29 +983,20 @@ function renderSqlPanel() {
 function addSqlItem(evt, scroll = true) {
   const body = document.getElementById('sqlBody');
   if (body.querySelector('.detail-empty')) body.innerHTML = '';
-
   const div = document.createElement('div');
   div.style.marginBottom = '10px';
-
-  const timeBadge = getTimeBadge(evt.duration_ms);
+  const tb = getTimeBadge(evt.duration_ms);
   let html = `
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
-      ${evt.duration_ms != null ? `<span class="badge ${timeBadge.cls}">${evt.duration_ms}ms</span>` : ''}
+      ${evt.duration_ms != null ? `<span class="badge ${tb.cls}">${evt.duration_ms}ms</span>` : ''}
       ${evt.user_id ? `<span class="badge badge-user">${escHtml(evt.user_id)}</span>` : ''}
       <span style="font-size:10px;color:var(--text-dim)">${formatTime(evt.timestamp)}</span>
     </div>
-    <div class="sql-block" style="cursor:pointer" onclick="selectEvent('${evt.id}')">${highlightSQL(evt.sql || '')}</div>
-  `;
-
-  if (evt.error) {
-    html += `<div class="query-error">${escHtml(evt.error)}</div>`;
-  } else if (evt.results && Array.isArray(evt.results) && evt.results.length > 0) {
-    html += renderResultTable(evt.results);
-  }
-
+    <div class="sql-block" style="cursor:pointer" onclick="selectEvent('${evt.id}');switchTab('detail')">${highlightSQL(evt.sql || '')}</div>`;
+  if (evt.error) html += `<div class="query-error">${escHtml(evt.error)}</div>`;
+  else if (evt.results?.length > 0) html += renderResultTable(evt.results);
   div.innerHTML = html;
   body.appendChild(div);
-
   document.getElementById('queryCount').textContent = events.filter(e => e.type === 'query').length;
   if (scroll) body.scrollTop = body.scrollHeight;
 }
@@ -905,7 +1009,7 @@ function renderResultTable(rows) {
   html += '</tr></thead><tbody>';
   rows.forEach(row => {
     html += '<tr>';
-    cols.forEach(c => html += `<td title="${escHtml(String(row[c] ?? ''))}">${escHtml(String(row[c] ?? ''))}</td>`);
+    cols.forEach(c => html += `<td title="${escHtml(String(row[c]??''))}">${escHtml(String(row[c]??''))}</td>`);
     html += '</tr>';
   });
   html += '</tbody></table></div>';
@@ -913,21 +1017,17 @@ function renderResultTable(rows) {
 }
 
 // =========================================================================
-// Stats Panel
+// Stats
 // =========================================================================
 function refreshStats() {
-  fetch('/api/stats')
-    .then(r => r.json())
-    .then(s => {
-      stats = s;
-      renderStats(s);
-      // Update header
-      document.getElementById('hActiveUsers').textContent = s.active_users;
-      document.getElementById('hTotalChats').textContent = s.total_chats;
-      document.getElementById('hTotalErrors').textContent = s.total_errors;
-      document.getElementById('hAvgResponse').textContent = s.avg_response_ms + 'ms';
-    })
-    .catch(() => {});
+  fetch('/api/stats').then(r => r.json()).then(s => {
+    stats = s;
+    renderStats(s);
+    document.getElementById('hActiveUsers').textContent = s.active_users;
+    document.getElementById('hTotalChats').textContent = s.total_chats;
+    document.getElementById('hTotalErrors').textContent = s.total_errors;
+    document.getElementById('hAvgResponse').textContent = s.avg_response_ms + 'ms';
+  }).catch(() => {});
 }
 
 function renderStats(s) {
@@ -941,12 +1041,12 @@ function renderStats(s) {
       </div>
       <div class="stat-card">
         <div class="stat-label">Avg Response</div>
-        <div class="stat-value" style="color:${s.avg_response_ms > 5000 ? 'var(--red)' : s.avg_response_ms > 2000 ? 'var(--orange)' : 'var(--green)'}">${formatDuration(s.avg_response_ms)}</div>
+        <div class="stat-value" style="color:${s.avg_response_ms>5000?'var(--red)':s.avg_response_ms>2000?'var(--orange)':'var(--green)'}">${formatDuration(s.avg_response_ms)}</div>
         <div class="stat-sub">per chat</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Error Rate</div>
-        <div class="stat-value" style="color:${s.error_rate > 5 ? 'var(--red)' : s.error_rate > 1 ? 'var(--orange)' : 'var(--green)'}">${s.error_rate}%</div>
+        <div class="stat-value" style="color:${s.error_rate>5?'var(--red)':s.error_rate>1?'var(--orange)':'var(--green)'}">${s.error_rate}%</div>
         <div class="stat-sub">${s.total_errors} total</div>
       </div>
       <div class="stat-card">
@@ -955,100 +1055,74 @@ function renderStats(s) {
         <div class="stat-sub">${s.total_chats} total</div>
       </div>
     </div>
-
     <div class="stat-card">
       <div class="stat-label">Avg Query Time</div>
       <div style="display:flex;align-items:baseline;gap:6px">
-        <span style="font-size:18px;font-weight:700;color:${s.avg_query_ms > 500 ? 'var(--red)' : s.avg_query_ms > 100 ? 'var(--orange)' : 'var(--green)'}">${formatDuration(s.avg_query_ms)}</span>
+        <span style="font-size:18px;font-weight:700;color:${s.avg_query_ms>500?'var(--red)':s.avg_query_ms>100?'var(--orange)':'var(--green)'}">${formatDuration(s.avg_query_ms)}</span>
         <span style="font-size:11px;color:var(--text-dim)">${s.total_queries} queries</span>
       </div>
     </div>
-
     <div class="section-title">Hourly Chat Volume (24h)</div>
-    <div class="stat-card" style="padding:8px">
-      ${renderBarChart(s.hourly || {})}
-    </div>
-
+    <div class="stat-card" style="padding:8px">${renderBarChart(s.hourly||{})}</div>
     <div class="section-title">Event Types</div>
-    <div class="stat-card" style="padding:8px">
-      ${renderTypeBreakdown(s.type_counts || {})}
-    </div>
-
+    <div class="stat-card" style="padding:8px">${renderTypeBreakdown(s.type_counts||{})}</div>
     <div class="section-title">Top Topics</div>
     <div class="topic-list" style="margin-bottom:12px">
-      ${(s.topics || []).map(t => `<span class="topic-tag">${escHtml(t)}</span>`).join('')}
-      ${(s.topics || []).length === 0 ? '<span style="color:var(--text-dim);font-size:11px">No topics yet</span>' : ''}
+      ${(s.topics||[]).map(t=>`<span class="topic-tag">${escHtml(t)}</span>`).join('')}
+      ${(s.topics||[]).length===0?'<span style="color:var(--text-dim);font-size:11px">No topics yet</span>':''}
     </div>
-
     <div class="section-title">Moderation Queue</div>
     <div class="stat-card">
       <div style="display:flex;gap:16px;font-size:12px">
-        <span style="color:var(--red)">Flagged: ${s.flagged || 0}</span>
-        <span style="color:var(--orange)">Unreviewed: ${s.unreviewed || 0}</span>
-        <span style="color:var(--green)">Reviewed: ${s.reviewed || 0}</span>
+        <span style="color:var(--red)">Flagged: ${s.flagged||0}</span>
+        <span style="color:var(--orange)">Unreviewed: ${s.unreviewed||0}</span>
+        <span style="color:var(--green)">Reviewed: ${s.reviewed||0}</span>
       </div>
     </div>
-    <div id="modQueue"></div>
-  `;
-
-  // Render moderation queue items
+    <div id="modQueue"></div>`;
   renderModQueue();
 }
 
 function renderBarChart(hourly) {
   const entries = Object.entries(hourly);
-  if (entries.length === 0) return '<div style="color:var(--text-dim);font-size:11px;text-align:center;padding:10px">No data yet</div>';
-
-  const max = Math.max(...entries.map(e => e[1]), 1);
+  if (!entries.length) return '<div style="color:var(--text-dim);font-size:11px;text-align:center;padding:10px">No data yet</div>';
+  const max = Math.max(...entries.map(e=>e[1]),1);
   let html = '<div class="bar-chart">';
-  entries.forEach(([hour, count]) => {
-    const pct = (count / max * 100);
-    html += `<div class="bar" style="height:${Math.max(pct, 3)}%" data-label="${hour}: ${count}"></div>`;
-  });
-  html += '</div>';
-  html += `<div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-dim);padding:0 2px">`;
-  if (entries.length > 0) {
-    html += `<span>${entries[0][0]}</span>`;
-    if (entries.length > 1) html += `<span>${entries[entries.length-1][0]}</span>`;
-  }
-  html += '</div>';
+  entries.forEach(([h,c])=>{ html+=`<div class="bar" style="height:${Math.max(c/max*100,3)}%" data-label="${h}: ${c}"></div>`; });
+  html+='</div><div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-dim);padding:0 2px">';
+  html+=`<span>${entries[0][0]}</span>`;
+  if(entries.length>1) html+=`<span>${entries[entries.length-1][0]}</span>`;
+  html+='</div>';
   return html;
 }
 
 function renderTypeBreakdown(counts) {
-  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
-  const colors = { chat: 'var(--chat-color)', query: 'var(--query-color)', error: 'var(--error-color)', system: 'var(--system-color)' };
+  const total = Object.values(counts).reduce((a,b)=>a+b,0)||1;
+  const colors = {chat:'var(--chat-color)',query:'var(--query-color)',error:'var(--error-color)',system:'var(--system-color)'};
   let html = '<div style="display:flex;height:20px;border-radius:4px;overflow:hidden;margin-bottom:6px">';
-  Object.entries(counts).forEach(([type, count]) => {
-    const pct = count / total * 100;
-    if (pct > 0) {
-      html += `<div style="width:${pct}%;background:${colors[type] || 'var(--text-dim)'}" title="${type}: ${count}"></div>`;
-    }
+  Object.entries(counts).forEach(([t,c])=>{
+    const pct=c/total*100;
+    if(pct>0) html+=`<div style="width:${pct}%;background:${colors[t]||'var(--text-dim)'}" title="${t}: ${c}"></div>`;
   });
-  html += '</div><div style="display:flex;gap:12px;flex-wrap:wrap">';
-  Object.entries(counts).forEach(([type, count]) => {
-    html += `<span style="font-size:11px;color:${colors[type] || 'var(--text-dim)'}">${type}: ${count}</span>`;
-  });
-  html += '</div>';
+  html+='</div><div style="display:flex;gap:12px;flex-wrap:wrap">';
+  Object.entries(counts).forEach(([t,c])=>{ html+=`<span style="font-size:11px;color:${colors[t]||'var(--text-dim)'}">${t}: ${c}</span>`; });
+  html+='</div>';
   return html;
 }
 
 function renderModQueue() {
   const container = document.getElementById('modQueue');
   if (!container) return;
-
-  const flaggedEvents = events.filter(e => moderation[e.id]?.flagged && !moderation[e.id]?.reviewed);
-  if (flaggedEvents.length === 0) {
+  const flagged = events.filter(e => moderation[e.id]?.flagged && !moderation[e.id]?.reviewed);
+  if (!flagged.length) {
     container.innerHTML = '<div style="font-size:11px;color:var(--text-dim);padding:4px 8px">No items in queue</div>';
     return;
   }
-
-  container.innerHTML = flaggedEvents.slice(-20).reverse().map(evt => `
-    <div class="mod-queue-item" onclick="selectEvent('${evt.id}')">
+  container.innerHTML = flagged.slice(-20).reverse().map(evt=>`
+    <div class="mod-queue-item" onclick="selectEvent('${evt.id}');switchTab('detail')">
       <div class="mod-q-type" style="color:var(--${evt.type}-color)">${evt.type}</div>
       <div class="mod-q-preview">${escHtml(getPreview(evt))}</div>
-    </div>
-  `).join('');
+    </div>`).join('');
 }
 
 // =========================================================================
@@ -1056,28 +1130,108 @@ function renderModQueue() {
 // =========================================================================
 function toggleFlag() {
   if (!selectedId) return;
-  const current = moderation[selectedId]?.flagged || false;
-  postModeration(selectedId, { flagged: !current });
+  postModeration(selectedId, { flagged: !(moderation[selectedId]?.flagged) });
 }
-
 function toggleReview() {
   if (!selectedId) return;
-  const current = moderation[selectedId]?.reviewed || false;
-  postModeration(selectedId, { reviewed: !current });
+  postModeration(selectedId, { reviewed: !(moderation[selectedId]?.reviewed) });
 }
-
 function saveNote() {
   if (!selectedId) return;
-  const note = document.getElementById('noteInput').value;
-  postModeration(selectedId, { note });
+  postModeration(selectedId, { note: document.getElementById('noteInput').value });
 }
-
 function postModeration(eventId, data) {
   fetch(`/api/moderate/${eventId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   }).catch(() => {});
+}
+
+// =========================================================================
+// Settings
+// =========================================================================
+function openSettings() {
+  loadConfig();
+  document.getElementById('settingsOverlay').classList.add('open');
+}
+function closeSettings() {
+  document.getElementById('settingsOverlay').classList.remove('open');
+}
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const data = await r.json();
+    appConfig = data.config;
+    document.getElementById('cfgOllamaUrl').value = appConfig.ollama_url || 'http://localhost:11434';
+    document.getElementById('cfgSystemPrompt').value = appConfig.system_prompt || '';
+    document.getElementById('cfgTemperature').value = appConfig.temperature ?? 0.7;
+    // Populate model dropdown
+    await loadModels();
+    const sel = document.getElementById('cfgModel');
+    sel.value = appConfig.default_model || '';
+  } catch(e) {}
+}
+async function saveSettings() {
+  const cfg = {
+    ollama_url: document.getElementById('cfgOllamaUrl').value,
+    default_model: document.getElementById('cfgModel').value,
+    system_prompt: document.getElementById('cfgSystemPrompt').value,
+    temperature: parseFloat(document.getElementById('cfgTemperature').value) || 0.7,
+  };
+  await fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  });
+  appConfig = cfg;
+  closeSettings();
+}
+
+// =========================================================================
+// Models
+// =========================================================================
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    const data = await r.json();
+    ollamaModels = data.models || [];
+  } catch(e) {
+    ollamaModels = [];
+  }
+  populateModelDropdowns();
+}
+
+function populateModelDropdowns() {
+  const selectors = [document.getElementById('modelSelect'), document.getElementById('cfgModel')];
+  selectors.forEach(sel => {
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = '';
+    if (ollamaModels.length === 0) {
+      sel.innerHTML = '<option value="">No models found</option>';
+      return;
+    }
+    ollamaModels.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = m.name;
+      sel.appendChild(opt);
+    });
+    if (current && ollamaModels.some(m => m.name === current)) {
+      sel.value = current;
+    } else if (appConfig.default_model) {
+      sel.value = appConfig.default_model;
+    }
+  });
+}
+
+// =========================================================================
+// Clear events
+// =========================================================================
+function clearEvents() {
+  if (!confirm('Clear all events? This cannot be undone.')) return;
+  fetch('/api/clear', { method: 'POST' }).catch(() => {});
 }
 
 // =========================================================================
@@ -1088,44 +1242,34 @@ function escHtml(s) {
   d.textContent = s;
   return d.innerHTML;
 }
-
 function formatTime(ts) {
   if (!ts) return '';
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(ts * 1000).toLocaleTimeString('de-DE', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
 }
-
 function formatDuration(ms) {
-  if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
+  if (ms >= 1000) return (ms/1000).toFixed(1) + 's';
   return Math.round(ms) + 'ms';
 }
-
 function getTimeBadge(ms) {
   if (!ms) return { cls: 'badge-time' };
   if (ms < 100) return { cls: 'badge-fast' };
   if (ms < 500) return { cls: 'badge-medium' };
   return { cls: 'badge-slow' };
 }
-
 function highlightSQL(sql) {
-  const keywords = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|IS|NULL|AS|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|INDEX|COUNT|SUM|AVG|MIN|MAX|DISTINCT|BETWEEN|LIKE|UNION|ALL|EXISTS|CASE|WHEN|THEN|ELSE|END|WITH|RECURSIVE)\b/gi;
-  const strings = /('[^']*')/g;
-  const numbers = /\b(\d+\.?\d*)\b/g;
-
-  let result = escHtml(sql);
-  result = result.replace(strings, '<span class="sql-string">$1</span>');
-  result = result.replace(keywords, '<span class="sql-keyword">$1</span>');
-  result = result.replace(numbers, (m) => {
-    // Don't highlight numbers inside already-highlighted spans
-    return `<span class="sql-number">${m}</span>`;
-  });
-  return result;
+  const kw = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|IS|NULL|AS|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|INDEX|COUNT|SUM|AVG|MIN|MAX|DISTINCT|BETWEEN|LIKE|UNION|ALL|EXISTS|CASE|WHEN|THEN|ELSE|END|WITH|RECURSIVE)\b/gi;
+  let r = escHtml(sql);
+  r = r.replace(/('[^']*')/g, '<span class="sql-string">$1</span>');
+  r = r.replace(kw, '<span class="sql-keyword">$1</span>');
+  r = r.replace(/\b(\d+\.?\d*)\b/g, '<span class="sql-number">$1</span>');
+  return r;
 }
 
 // =========================================================================
 // Init
 // =========================================================================
 connectSSE();
+loadConfig().then(() => loadModels());
 setInterval(refreshStats, 10000);
 setTimeout(refreshStats, 500);
 </script>

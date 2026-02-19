@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """WaWi Chatbot Admin Monitor — zero-dependency server on port 7779.
 
-Receives events from the chatbot SDK (monitor.py), persists them to JSONL,
+Receives events from the chatbot SDK, proxies chat requests to Ollama,
 serves the admin dashboard, and pushes live updates via SSE.
 """
 
@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -27,19 +29,28 @@ PORT = 7779
 MAX_EVENTS = 5000
 DATA_DIR = Path(__file__).resolve().parent / "data"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
+CONFIG_FILE = DATA_DIR / "config.json"
 PUBLIC_DIR = Path(__file__).resolve().parent / "public"
+
+# Default chatbot config (overridden by config.json)
+config = {
+    "ollama_url": "http://localhost:11434",
+    "default_model": "llama3:8b",
+    "system_prompt": "",
+    "temperature": 0.7,
+}
+config_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 events: list[dict] = []
 events_lock = threading.Lock()
-moderation: dict[str, dict] = {}  # event_id -> {flagged, reviewed, note}
+moderation: dict[str, dict] = {}
 moderation_lock = threading.Lock()
 sse_clients: list[queue.Queue] = []
 sse_lock = threading.Lock()
 
-# German + English stop words for topic extraction
 STOP_WORDS = frozenset(
     "der die das ein eine einer eines einem einen und oder aber wenn dann "
     "als auch noch schon doch nur mal so da hier dort wie was wer wo wann "
@@ -60,7 +71,6 @@ STOP_WORDS = frozenset(
 
 
 def extract_topics(text: str, top_n: int = 5) -> list[str]:
-    """Extract top-N topic words from text."""
     words = re.findall(r"\b[a-zA-ZäöüÄÖÜß]{3,}\b", text.lower())
     freq: dict[str, int] = defaultdict(int)
     for w in words:
@@ -70,10 +80,32 @@ def extract_topics(text: str, top_n: int = 5) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Config persistence
+# ---------------------------------------------------------------------------
+def load_config():
+    global config
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            config.update(saved)
+        except Exception:
+            pass
+
+
+def save_config():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[config] Error saving: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 def load_events():
-    """Load events from JSONL on startup."""
     global events
     if not EVENTS_FILE.exists():
         return
@@ -85,18 +117,15 @@ def load_events():
                 try:
                     evt = json.loads(line)
                     loaded.append(evt)
-                    # Restore moderation state
                     mod = evt.get("_moderation")
                     if mod:
                         moderation[evt["id"]] = mod
                 except json.JSONDecodeError:
                     continue
-    # Keep only the last MAX_EVENTS
     events = loaded[-MAX_EVENTS:]
 
 
 def append_event_to_file(evt: dict):
-    """Append a single event to the JSONL file."""
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(EVENTS_FILE, "a", encoding="utf-8") as f:
@@ -106,17 +135,12 @@ def append_event_to_file(evt: dict):
 
 
 def persist_moderation(event_id: str, mod: dict):
-    """Update the moderation state in the JSONL file (rewrite approach)."""
-    # For simplicity, we just append a moderation-update marker.
-    # On load, the last moderation state wins via the _moderation field.
     try:
         with events_lock:
             for evt in events:
                 if evt["id"] == event_id:
                     evt["_moderation"] = mod
-                    # Re-persist the event line
                     break
-        # Rewrite the whole file (safe for <5000 events)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(EVENTS_FILE, "w", encoding="utf-8") as f:
             with events_lock:
@@ -126,11 +150,92 @@ def persist_moderation(event_id: str, mod: dict):
         print(f"[persist] Error writing moderation: {e}", file=sys.stderr)
 
 
+def clear_all_events():
+    global events, moderation
+    with events_lock:
+        events = []
+    with moderation_lock:
+        moderation = {}
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+            pass  # truncate
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Ingest + broadcast helper
+# ---------------------------------------------------------------------------
+def ingest_event(evt: dict) -> dict:
+    """Add event to memory, persist, broadcast. Returns the event."""
+    if "id" not in evt:
+        evt["id"] = str(uuid.uuid4())
+    if "timestamp" not in evt:
+        evt["timestamp"] = time.time()
+    if "type" not in evt:
+        evt["type"] = "system"
+
+    with events_lock:
+        events.append(evt)
+        while len(events) > MAX_EVENTS:
+            events.pop(0)
+
+    append_event_to_file(evt)
+    broadcast_event(evt)
+    return evt
+
+
+# ---------------------------------------------------------------------------
+# Ollama proxy
+# ---------------------------------------------------------------------------
+def call_ollama(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+    """Call Ollama chat API. Returns (answer, duration_ms)."""
+    with config_lock:
+        ollama_url = config["ollama_url"]
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": question})
+
+    body: dict = {"model": model, "messages": messages, "stream": False}
+    if temperature is not None:
+        body["options"] = {"temperature": temperature}
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        f"{ollama_url}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    answer = result.get("message", {}).get("content", "")
+    duration_ms = (time.time() - start) * 1000
+    return answer, round(duration_ms, 1)
+
+
+def list_ollama_models() -> list[dict]:
+    """Fetch available models from Ollama."""
+    with config_lock:
+        ollama_url = config["ollama_url"]
+    try:
+        req = Request(f"{ollama_url}/api/tags", method="GET")
+        resp = urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        models = data.get("models", [])
+        return [{"name": m["name"], "size": m.get("size", 0)} for m in models]
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Stats engine
 # ---------------------------------------------------------------------------
 def compute_stats() -> dict:
-    """Compute dashboard statistics from current events."""
     with events_lock:
         evts = list(events)
 
@@ -142,7 +247,6 @@ def compute_stats() -> dict:
     queries = [e for e in evts if e.get("type") == "query"]
     errors = [e for e in evts if e.get("type") == "error"]
 
-    # Active users (last hour)
     recent_users = set()
     recent_msgs = 0
     for e in evts:
@@ -154,22 +258,17 @@ def compute_stats() -> dict:
             if e.get("type") == "chat":
                 recent_msgs += 1
 
-    # Average response time
     durations = [c.get("duration_ms", 0) for c in chats if c.get("duration_ms")]
     avg_response = (sum(durations) / len(durations)) if durations else 0
 
-    # Query times
     query_durations = [q.get("duration_ms", 0) for q in queries if q.get("duration_ms")]
     avg_query = (sum(query_durations) / len(query_durations)) if query_durations else 0
 
-    # Error rate
     error_rate = (len(errors) / total * 100) if total > 0 else 0
 
-    # Top topics from chat questions
     all_questions = " ".join(c.get("question", "") for c in chats)
     topics = extract_topics(all_questions, top_n=10)
 
-    # Hourly distribution (last 24h)
     hourly = defaultdict(int)
     twenty_four_ago = now - 86400
     for e in evts:
@@ -179,13 +278,11 @@ def compute_stats() -> dict:
             hourly[hour] += 1
     hourly_sorted = dict(sorted(hourly.items()))
 
-    # Moderation stats
     with moderation_lock:
         flagged_count = sum(1 for m in moderation.values() if m.get("flagged"))
         reviewed_count = sum(1 for m in moderation.values() if m.get("reviewed"))
         unreviewed = flagged_count - reviewed_count
 
-    # Type breakdown
     type_counts = defaultdict(int)
     for e in evts:
         type_counts[e.get("type", "unknown")] += 1
@@ -213,7 +310,6 @@ def compute_stats() -> dict:
 # SSE
 # ---------------------------------------------------------------------------
 def broadcast_event(evt: dict):
-    """Push event to all connected SSE clients."""
     data = json.dumps(evt, ensure_ascii=False)
     dead = []
     with sse_lock:
@@ -230,10 +326,8 @@ def broadcast_event(evt: dict):
 # HTTP Handler
 # ---------------------------------------------------------------------------
 class MonitorHandler(SimpleHTTPRequestHandler):
-    """Handles API requests and serves static files."""
 
     def log_message(self, fmt, *args):
-        # Suppress noisy SSE keep-alive logs
         msg = fmt % args
         if "GET /api/stream" in msg:
             return
@@ -254,7 +348,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def do_OPTIONS(self):
@@ -269,6 +363,12 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
         if path == "/event":
             return self._handle_post_event()
+        if path == "/api/chat":
+            return self._handle_chat()
+        if path == "/api/clear":
+            return self._handle_clear()
+        if path == "/api/config":
+            return self._handle_post_config()
         if path.startswith("/api/moderate/"):
             event_id = path.split("/api/moderate/", 1)[1]
             return self._handle_moderate(event_id)
@@ -276,7 +376,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self._send_json({"error": "Not found"}, 404)
 
     def _handle_post_event(self):
-        """Ingest an event from the chatbot SDK."""
         try:
             body = self._read_body()
             evt = json.loads(body)
@@ -284,26 +383,83 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, 400)
             return
 
-        # Ensure required fields
-        if "id" not in evt:
-            evt["id"] = str(uuid.uuid4())
-        if "timestamp" not in evt:
-            evt["timestamp"] = time.time()
-        if "type" not in evt:
-            evt["type"] = "system"
-
-        with events_lock:
-            events.append(evt)
-            # Ring buffer
-            while len(events) > MAX_EVENTS:
-                events.pop(0)
-
-        append_event_to_file(evt)
-        broadcast_event(evt)
+        evt = ingest_event(evt)
         self._send_json({"ok": True, "id": evt["id"]})
 
+    def _handle_chat(self):
+        """Proxy chat to Ollama: receive question, call LLM, log + return answer."""
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        question = data.get("question", "").strip()
+        if not question:
+            self._send_json({"error": "question is required"}, 400)
+            return
+
+        with config_lock:
+            model = data.get("model") or config["default_model"]
+            system_prompt = data.get("system_prompt", config["system_prompt"])
+            temperature = data.get("temperature", config["temperature"])
+
+        user_id = data.get("user_id", "admin")
+
+        try:
+            answer, duration_ms = call_ollama(question, model, system_prompt, temperature)
+        except Exception as e:
+            # Log the error
+            ingest_event({
+                "type": "error",
+                "message": str(e),
+                "error_type": "ollama_error",
+                "user_id": user_id,
+            })
+            self._send_json({"error": str(e)}, 502)
+            return
+
+        # Log the chat event
+        evt = ingest_event({
+            "type": "chat",
+            "user_id": user_id,
+            "question": question,
+            "answer": answer,
+            "duration_ms": duration_ms,
+            "model": model,
+        })
+
+        self._send_json({
+            "ok": True,
+            "id": evt["id"],
+            "answer": answer,
+            "duration_ms": duration_ms,
+            "model": model,
+        })
+
+    def _handle_clear(self):
+        clear_all_events()
+        broadcast_event({"type": "_clear"})
+        self._send_json({"ok": True})
+
+    def _handle_post_config(self):
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        with config_lock:
+            for key in ("ollama_url", "default_model", "system_prompt", "temperature"):
+                if key in data:
+                    config[key] = data[key]
+        save_config()
+        with config_lock:
+            self._send_json({"ok": True, "config": dict(config)})
+
     def _handle_moderate(self, event_id: str):
-        """Flag / review / note an event."""
         try:
             body = self._read_body()
             data = json.loads(body)
@@ -323,15 +479,12 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             moderation[event_id] = mod
 
         persist_moderation(event_id, mod)
-
-        # Broadcast moderation update
         broadcast_event({
             "type": "_moderation_update",
             "event_id": event_id,
             "moderation": mod,
             "timestamp": time.time(),
         })
-
         self._send_json({"ok": True, "moderation": mod})
 
     # ----- GET endpoints -----
@@ -351,10 +504,13 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return self._handle_stats()
         if path == "/api/moderation":
             return self._handle_get_moderation()
+        if path == "/api/models":
+            return self._handle_models()
+        if path == "/api/config":
+            return self._handle_get_config()
         if path == "/api/health":
             return self._send_json({"status": "ok", "events": len(events), "uptime_s": round(time.time() - SERVER_START)})
 
-        # Static files
         self._serve_static(path)
 
     def _serve_static(self, path: str):
@@ -386,7 +542,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self.wfile.write(content)
 
     def _handle_sse(self):
-        """Server-Sent Events stream."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -399,14 +554,12 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             sse_clients.append(q)
 
         try:
-            # Send existing events as initial batch
             with events_lock:
                 init = list(events)
             init_data = json.dumps(init, ensure_ascii=False)
             self.wfile.write(f"event: init\ndata: {init_data}\n\n".encode())
             self.wfile.flush()
 
-            # Send moderation state
             with moderation_lock:
                 mod_data = json.dumps(moderation, ensure_ascii=False)
             self.wfile.write(f"event: moderation\ndata: {mod_data}\n\n".encode())
@@ -418,7 +571,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(f"data: {data}\n\n".encode())
                     self.wfile.flush()
                 except queue.Empty:
-                    # Keep-alive
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -429,7 +581,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     sse_clients.remove(q)
 
     def _handle_get_events(self, params: dict):
-        """GET /api/events?type=chat&user_id=xxx&limit=100&offset=0"""
         type_filter = params.get("type", [None])[0]
         user_filter = params.get("user_id", [None])[0]
         flagged_only = params.get("flagged", [""])[0] == "true"
@@ -451,7 +602,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         total = len(filtered)
         page = filtered[offset:offset + limit]
 
-        # Attach moderation info
         with moderation_lock:
             for e in page:
                 mod = moderation.get(e["id"])
@@ -461,7 +611,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self._send_json({"total": total, "events": page})
 
     def _handle_conversations(self, params: dict):
-        """GET /api/conversations — group chats by user_id."""
         with events_lock:
             chats = [e for e in events if e.get("type") == "chat"]
 
@@ -490,6 +639,14 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         with moderation_lock:
             self._send_json({"moderation": dict(moderation)})
 
+    def _handle_models(self):
+        models = list_ollama_models()
+        self._send_json({"models": models})
+
+    def _handle_get_config(self):
+        with config_lock:
+            self._send_json({"config": dict(config)})
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -504,13 +661,14 @@ SERVER_START = time.time()
 
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    load_config()
     load_events()
     print(f"[chatbot-monitor] Loaded {len(events)} events from {EVENTS_FILE}")
+    print(f"[chatbot-monitor] Ollama: {config['ollama_url']}  Model: {config['default_model']}")
 
     server = ThreadedHTTPServer(("0.0.0.0", PORT), MonitorHandler)
     print(f"[chatbot-monitor] Server running on http://localhost:{PORT}")
     print(f"[chatbot-monitor] Dashboard: http://localhost:{PORT}/")
-    print(f"[chatbot-monitor] Health:    http://localhost:{PORT}/api/health")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
