@@ -5,54 +5,151 @@ Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL que
 ## Architecture
 
 ```
-Users → Web Chat → FastAPI Chatbot → Ollama
-                        ↓ (monitor SDK)
-                   POST /event → server.py (port 7779)
-                        ↓ (SSE)
-              Admin Dashboard http://localhost:7779
+Users → Web Chat → FastAPI Chatbot → Ollama (localhost:11434)
+                        ↓ (import monitor)
+              Admin Dashboard (localhost:7779)
 ```
+
+Everything runs on localhost — zero config, zero dependencies, just import and go.
 
 ## Quick Start
 
 ### 1. Start the monitor server
 
 ```bash
-cd chatbot-monitor
-python server.py
+python chatbot-monitor/server.py
 ```
 
-Server runs on **http://localhost:7779** — open in browser for the dashboard.
+Dashboard: **http://localhost:7779**
 
-### 2. Integrate the SDK in your FastAPI chatbot
+### 2. Connect your chatbot (pick your style)
+
+#### Option A: One-liner auto-logging with Ollama wrapper
+```python
+import monitor
+
+# Calls Ollama AND logs to dashboard automatically
+answer, ms = monitor.ollama_chat("Was kostet Artikel 4711?", user_id="user1")
+```
+That's it. The question, answer, timing, and model all appear on the dashboard.
+
+#### Option B: FastAPI middleware (zero-touch)
+```python
+from fastapi import FastAPI
+import monitor
+
+app = FastAPI()
+app.add_middleware(monitor.ChatMiddleware)   # <-- this one line
+
+@app.post("/chat")
+def chat(question: str, user_id: str = "anon"):
+    answer = your_llm_call(question)
+    return {"answer": answer}
+# Every POST to /chat is auto-logged — question, answer, timing, errors
+```
+
+#### Option C: Manual logging (full control)
+```python
+import monitor
+
+monitor.chat("user1", "Was kostet X?", "X kostet 29,90 EUR.", duration_ms=1200, model="llama3:8b")
+monitor.query("SELECT price FROM articles WHERE id=4711", results=[{"price": 29.90}], duration_ms=8)
+monitor.error("Ollama timeout", error_type="llm_timeout")
+```
+
+#### Option D: Decorator
+```python
+import monitor
+
+@monitor.track_chat(model="llama3:8b")
+def ask_bot(question: str, user_id: str = "anon") -> str:
+    return call_ollama(question)
+# Return value is auto-logged as the answer
+```
+
+## Wrappers (auto-log everything)
+
+### Ollama
+```python
+# Chat API (messages format)
+answer, ms = monitor.ollama_chat(
+    "Wie viele Schrauben M8 sind auf Lager?",
+    model="llama3:8b",
+    user_id="user1",
+    system_prompt="Du bist ein WaWi-Assistent.",
+)
+
+# Generate API (simple prompt)
+answer, ms = monitor.ollama_generate("Beschreibe Artikel 4711", user_id="user1")
+```
+
+### Database
+```python
+# SELECT — returns rows as list of dicts
+rows, ms = monitor.db_query(cursor, "SELECT * FROM articles WHERE id=?", (4711,))
+# rows = [{"id": 4711, "name": "Schraube M6", "price": 2.49}]
+
+# INSERT/UPDATE/DELETE
+ms = monitor.db_execute(cursor, "UPDATE articles SET price=? WHERE id=?", (19.99, 4711))
+```
+
+Both wrappers auto-log SQL, results, timing, and errors to the dashboard.
+
+### FastAPI Middleware
 
 ```python
-from chatbot_monitor import monitor
+app.add_middleware(monitor.ChatMiddleware)
+```
 
-# On startup
-monitor.init("http://localhost:7779")
+Auto-detects POST requests to `/chat`, `/api/chat`, `/ask`, `/api/ask`, `/message`, `/api/message`.
 
-# Log a chat interaction
-monitor.log_chat(
-    user_id="user123",
-    question="Was kostet Artikel 4711?",
-    answer="Artikel 4711 kostet 29,90 EUR.",
-    duration_ms=1240,
-    model="llama3:8b"
+Custom field mapping:
+```python
+app.add_middleware(monitor.ChatMiddleware,
+    paths=["/chat", "/api/v2/ask"],     # which endpoints to monitor
+    question_field="query",              # JSON field name for question
+    answer_field="response",             # JSON field name for answer
+    user_id_field="session_id",          # JSON field name for user ID
 )
+```
 
-# Log a database query
-monitor.log_query(
-    sql="SELECT price FROM articles WHERE id = 4711",
-    results=[{"price": 29.90}],
-    duration_ms=12,
-    user_id="user123"
-)
+## Full FastAPI Example
 
-# Log an error
-monitor.log_error("Ollama timeout after 30s", error_type="llm_timeout", user_id="user123")
+```python
+from fastapi import FastAPI
+import monitor
+import sqlite3
 
-# Log a system event
-monitor.log_system("startup", "Chatbot v2.1 started")
+app = FastAPI()
+app.add_middleware(monitor.ChatMiddleware)
+db = sqlite3.connect("wawi.db")
+
+@app.on_event("startup")
+def startup():
+    monitor.system("startup", "WaWi Chatbot started")
+
+@app.post("/chat")
+def chat_endpoint(body: dict):
+    user_id = body.get("user_id", "anon")
+    question = body.get("question", "")
+
+    # Query DB — auto-logged
+    rows, _ = monitor.db_query(
+        db.cursor(),
+        "SELECT * FROM articles WHERE name LIKE ?",
+        (f"%{question}%",),
+        user_id=user_id,
+    )
+
+    # Call Ollama — auto-logged
+    context = f"DB results: {rows}"
+    answer, _ = monitor.ollama_chat(
+        f"{question}\n\nContext: {context}",
+        user_id=user_id,
+        system_prompt="Du bist ein WaWi-Assistent. Antworte auf Deutsch.",
+    )
+
+    return {"answer": answer, "user_id": user_id}
 ```
 
 ## Dashboard
@@ -62,15 +159,6 @@ monitor.log_system("startup", "Chatbot v2.1 started")
 | Live Feed | Chat Detail | SQL Inspector | Stats & Moderation |
 |-----------|------------|---------------|-------------------|
 | All events, filterable | Q&A bubbles + moderation | Syntax-highlighted SQL + result tables | Users, response times, errors, topics |
-
-### Features
-
-- **Real-time SSE** — events appear instantly
-- **Filtering** — by type (chat/query/error) or flagged items
-- **Moderation** — flag, review, and add notes to any event
-- **SQL Inspector** — syntax highlighting, result tables, timing badges
-- **Stats** — active users, response times, error rates, hourly volume, top topics
-- **Persistence** — events saved to `data/events.jsonl`, survive restarts
 
 ## API Endpoints
 
@@ -82,37 +170,19 @@ monitor.log_system("startup", "Chatbot v2.1 started")
 | GET | `/api/conversations` | Group chats by user |
 | GET | `/api/stats` | Dashboard statistics |
 | POST | `/api/moderate/<id>` | Flag/review/note an event |
-| GET | `/api/moderation` | All moderation state |
 | GET | `/api/health` | Health check |
-
-## Event Types
-
-### chat
-```json
-{"type": "chat", "user_id": "u1", "question": "...", "answer": "...", "duration_ms": 1200, "model": "llama3:8b"}
-```
-
-### query
-```json
-{"type": "query", "sql": "SELECT ...", "results": [...], "duration_ms": 15, "user_id": "u1"}
-```
-
-### error
-```json
-{"type": "error", "message": "Ollama timeout", "error_type": "llm_timeout", "user_id": "u1"}
-```
-
-### system
-```json
-{"type": "system", "action": "startup", "message": "Chatbot started"}
-```
 
 ## Configuration
 
-- **Port**: 7779 (change `PORT` in `server.py`)
-- **Max events**: 5000 ring buffer
-- **Max result rows**: 50 (SDK truncates larger result sets)
-- **Persistence**: `data/events.jsonl` (auto-created)
+Default: everything on localhost, zero config needed.
+
+| Setting | Default | Override |
+|---------|---------|----------|
+| Monitor server | `localhost:7779` | `monitor.init("http://other:7779")` |
+| Ollama | `localhost:11434` | `monitor.ollama_chat(..., ollama_url="http://other:11434")` |
+| Max events | 5000 | `MAX_EVENTS` in `server.py` |
+| Max result rows | 50 | `monitor.init(max_result_rows=100)` |
+| Disable in tests | — | `monitor.disable()` |
 
 ## Zero Dependencies
 
