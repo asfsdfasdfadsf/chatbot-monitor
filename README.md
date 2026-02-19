@@ -1,6 +1,6 @@
 # WaWi Chatbot Admin Monitor
 
-Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL queries, errors, and moderation.
+Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL queries, errors, moderation, user management, and authentication.
 
 ## Architecture
 
@@ -8,9 +8,27 @@ Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL que
 Users → Web Chat → FastAPI Chatbot → Ollama (localhost:11434)
                         ↓ (import monitor)
               Admin Dashboard (localhost:7779)
+                  ↓ (cookie auth, roles)
+            Admin: full control
+            User: chat + own events
 ```
 
 Everything runs on localhost — zero config, zero dependencies, just import and go.
+
+## Features
+
+- **Live event feed** — chat, query, error, and system events in real-time via SSE
+- **Built-in chat** — proxy questions to Ollama directly from the dashboard
+- **SQL inspector** — syntax-highlighted queries with result tables
+- **Moderation** — flag, review, and annotate chat events
+- **User management** — block/unblock chatbot end-users, set priorities
+- **Authentication** — cookie-based login/register with session management
+- **Role-based access** — admin (full control) vs user (chat + own events)
+- **Account management** — create accounts, change roles and priorities, delete accounts
+- **Bot kill switch** — admin can globally disable the bot with one toggle
+- **User priorities** — high/normal/low priority on both dashboard accounts and chatbot end-users
+- **Python SDK** — fire-and-forget logging, Ollama wrapper, DB wrapper, FastAPI middleware
+- **Zero dependencies** — pure Python stdlib, no pip install needed
 
 ## Quick Start
 
@@ -21,6 +39,12 @@ python chatbot-monitor/server.py
 ```
 
 Dashboard: **http://localhost:7779**
+
+On first startup, a default admin account is created:
+- **Username:** `admin`
+- **Password:** `admin`
+
+Change this password or create a new admin account after first login.
 
 ### 2. Connect your chatbot (pick your style)
 
@@ -66,6 +90,56 @@ def ask_bot(question: str, user_id: str = "anon") -> str:
     return call_ollama(question)
 # Return value is auto-logged as the answer
 ```
+
+### 3. Check user status from your chatbot
+
+```python
+import monitor
+
+# Simple block check
+if not monitor.is_user_allowed("user123"):
+    return "You have been blocked by an administrator."
+
+# Full status (allowed, priority, bot_enabled)
+status = monitor.get_user_status("user123")
+if not status["bot_enabled"]:
+    return "The bot is currently disabled for maintenance."
+if not status["allowed"]:
+    return "You have been blocked."
+print(f"User priority: {status['priority']}")  # high, normal, or low
+```
+
+## Authentication & Roles
+
+### Login/Register
+
+The dashboard requires authentication. On page load, users see a login screen with login and register tabs.
+
+- **Admin** — full control: all events, moderation, user management, settings, accounts, bot toggle
+- **User** — limited view: chat tab, own events in the feed, no access to admin features
+
+Sessions use HTTP cookies (24h expiry). No HTTPS required for LAN deployments.
+
+### Default Admin
+
+On first startup (when no admin account exists), the server creates:
+- Username: `admin`, Password: `admin`
+
+### Account Management (Admin)
+
+Admins can:
+- View all dashboard accounts
+- Change account roles (admin/user)
+- Set account priorities (high/normal/low)
+- Delete accounts (cannot delete self or last admin)
+
+### Bot Kill Switch
+
+Admins can globally disable the bot via the dashboard or config API. When disabled:
+- `POST /event` returns 503
+- `POST /api/chat` returns 503
+- `GET /api/users/<id>/check` reports `bot_enabled: false`
+- SDK `get_user_status()` reflects the disabled state
 
 ## Wrappers (auto-log everything)
 
@@ -133,6 +207,15 @@ def chat_endpoint(body: dict):
     user_id = body.get("user_id", "anon")
     question = body.get("question", "")
 
+    # Check if user is allowed
+    if not monitor.is_user_allowed(user_id):
+        return {"error": "You have been blocked."}
+
+    # Check full status (including bot toggle)
+    status = monitor.get_user_status(user_id)
+    if not status["bot_enabled"]:
+        return {"error": "Bot is currently disabled."}
+
     # Query DB — auto-logged
     rows, _ = monitor.db_query(
         db.cursor(),
@@ -154,23 +237,88 @@ def chat_endpoint(body: dict):
 
 ## Dashboard
 
-4-panel layout:
+4-panel layout with role-based visibility:
 
 | Live Feed | Chat Detail | SQL Inspector | Stats & Moderation |
 |-----------|------------|---------------|-------------------|
 | All events, filterable | Q&A bubbles + moderation | Syntax-highlighted SQL + result tables | Users, response times, errors, topics |
 
+**Admin sees:** All tabs, settings, user management, accounts panel, bot toggle, moderation controls, clear button
+
+**User sees:** Chat tab, own events in feed
+
 ## API Endpoints
+
+### Public (no auth required)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/event` | Ingest an event |
-| GET | `/api/stream` | SSE event stream |
-| GET | `/api/events?type=chat&user_id=x&limit=100` | Query events |
+| GET | `/api/health` | Health check (status, event/user counts, uptime) |
+| POST | `/event` | Ingest an event from SDK |
+| GET | `/api/users/<id>/check` | Check if user is allowed + priority + bot status |
+| POST | `/api/auth/login` | Login with `{username, password}` |
+| POST | `/api/auth/register` | Register with `{username, password}` |
+| POST | `/api/auth/logout` | Logout (clears session cookie) |
+| GET | `/api/auth/me` | Get current session user info |
+
+### User-level (requires login)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/stream` | SSE event stream (filtered by role) |
+| POST | `/api/chat` | Send question to Ollama |
+| GET | `/api/models` | List available Ollama models |
+
+### Admin-level (requires admin role)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/events` | Query events (`?type=chat&user_id=x&limit=100&flagged=true`) |
 | GET | `/api/conversations` | Group chats by user |
 | GET | `/api/stats` | Dashboard statistics |
 | POST | `/api/moderate/<id>` | Flag/review/note an event |
-| GET | `/api/health` | Health check |
+| GET | `/api/moderation` | Get all moderation data |
+| GET/POST | `/api/config` | Get/update server config (including `bot_enabled`) |
+| GET | `/api/users` | List all chatbot end-users |
+| GET | `/api/users/<id>` | Get user detail with recent events |
+| POST | `/api/users/<id>/block` | Block a chatbot end-user |
+| POST | `/api/users/<id>/unblock` | Unblock a chatbot end-user |
+| POST | `/api/users/<id>/update` | Update user note, status, or priority |
+| GET | `/api/accounts` | List all dashboard accounts |
+| POST | `/api/accounts/<name>/role` | Change account role (`{role: "admin"\|"user"}`) |
+| POST | `/api/accounts/<name>/priority` | Change account priority (`{priority: "high"\|"normal"\|"low"}`) |
+| POST | `/api/accounts/<name>/delete` | Delete a dashboard account |
+| POST | `/api/clear` | Clear all events |
+
+## SDK Reference
+
+### Functions
+
+| Function | Description |
+|----------|-------------|
+| `monitor.chat(user_id, question, answer, ...)` | Log a chat event |
+| `monitor.query(sql, results, ...)` | Log a database query |
+| `monitor.error(message, error_type, ...)` | Log an error |
+| `monitor.system(action, message, ...)` | Log a system event |
+| `monitor.ollama_chat(prompt, ...)` | Call Ollama + auto-log |
+| `monitor.ollama_generate(prompt, ...)` | Call Ollama generate + auto-log |
+| `monitor.db_query(cursor, sql, params, ...)` | Execute SELECT + auto-log |
+| `monitor.db_execute(cursor, sql, params, ...)` | Execute INSERT/UPDATE/DELETE + auto-log |
+| `monitor.is_user_allowed(user_id)` | Check if user is blocked (fail-open) |
+| `monitor.get_user_status(user_id)` | Get `{allowed, priority, bot_enabled}` (fail-open) |
+| `monitor.init(server_url)` | Override server URL |
+| `monitor.disable()` / `monitor.enable()` | Toggle monitoring |
+
+### Decorators
+
+| Decorator | Description |
+|-----------|-------------|
+| `@monitor.track_chat(model="...")` | Auto-log function input/output as chat |
+| `@monitor.track_query()` | Auto-log function as query |
+
+### Aliases (backward compat)
+
+`monitor.log_chat`, `monitor.log_query`, `monitor.log_error`, `monitor.log_system`
 
 ## Configuration
 
@@ -179,11 +327,48 @@ Default: everything on localhost, zero config needed.
 | Setting | Default | Override |
 |---------|---------|----------|
 | Monitor server | `localhost:7779` | `monitor.init("http://other:7779")` |
-| Ollama | `localhost:11434` | `monitor.ollama_chat(..., ollama_url="http://other:11434")` |
+| Ollama | `localhost:11434` | Dashboard settings or `monitor.ollama_chat(..., ollama_url="...")` |
+| Default model | `llama3:8b` | Dashboard settings |
+| System prompt | (empty) | Dashboard settings |
+| Temperature | `0.7` | Dashboard settings |
+| Bot enabled | `true` | Dashboard settings or `POST /api/config` |
 | Max events | 5000 | `MAX_EVENTS` in `server.py` |
 | Max result rows | 50 | `monitor.init(max_result_rows=100)` |
-| Disable in tests | — | `monitor.disable()` |
+| Session TTL | 24 hours | `SESSION_TTL` in `server.py` |
+| Disable in tests | -- | `monitor.disable()` |
+
+## Data Storage
+
+All data stored in `data/` directory (git-ignored):
+
+| File | Contents |
+|------|----------|
+| `data/events.jsonl` | All events (append-only JSONL) |
+| `data/config.json` | Server configuration |
+| `data/users.json` | Chatbot end-user profiles |
+| `data/accounts.json` | Dashboard account credentials |
+
+## Testing
+
+```bash
+# Start the server
+python server.py
+
+# Run the full test suite (in another terminal)
+python test_all.py
+```
+
+The test suite covers 166 tests across 23 sections: server connectivity, authentication, role-based access control, event ingestion, event queries, conversations, stats, moderation, config, Ollama chat, SDK, user management, user permissions, user status, priorities, bot toggle, account management, persistence, SSE streaming, and static file serving.
 
 ## Zero Dependencies
 
 Both `server.py` and `monitor.py` use only Python stdlib. No pip install needed.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `server.py` | HTTP server: auth, events, SSE, Ollama proxy, user/account management |
+| `monitor.py` | Python SDK: fire-and-forget logging, wrappers, middleware |
+| `public/index.html` | Dashboard UI: login, chat, feed, stats, admin panels |
+| `test_all.py` | Comprehensive test suite (166 tests) |
