@@ -2,7 +2,8 @@
 """WaWi Chatbot Admin Monitor — zero-dependency server on port 7779.
 
 Receives events from the chatbot SDK, proxies chat requests to Ollama,
-serves the admin dashboard, and pushes live updates via SSE.
+manages users (block/allow), serves the admin dashboard, and pushes
+live updates via SSE.
 """
 
 import json
@@ -30,9 +31,9 @@ MAX_EVENTS = 5000
 DATA_DIR = Path(__file__).resolve().parent / "data"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 CONFIG_FILE = DATA_DIR / "config.json"
+USERS_FILE = DATA_DIR / "users.json"
 PUBLIC_DIR = Path(__file__).resolve().parent / "public"
 
-# Default chatbot config (overridden by config.json)
 config = {
     "ollama_url": "http://localhost:11434",
     "default_model": "llama3:8b",
@@ -50,6 +51,11 @@ moderation: dict[str, dict] = {}
 moderation_lock = threading.Lock()
 sse_clients: list[queue.Queue] = []
 sse_lock = threading.Lock()
+
+# User management: user_id -> { status, first_seen, last_seen, ... }
+# status: "active" | "blocked" | "restricted"
+users: dict[str, dict] = {}
+users_lock = threading.Lock()
 
 STOP_WORDS = frozenset(
     "der die das ein eine einer eines einem einen und oder aber wenn dann "
@@ -103,7 +109,87 @@ def save_config():
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# User management persistence
+# ---------------------------------------------------------------------------
+def load_users():
+    global users
+    if USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+        except Exception:
+            pass
+
+
+def save_users():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with users_lock:
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[users] Error saving: {e}", file=sys.stderr)
+
+
+def touch_user(user_id: str):
+    """Auto-register / update last_seen for a user on every event."""
+    if not user_id or user_id == "admin":
+        return
+    now = time.time()
+    with users_lock:
+        if user_id not in users:
+            users[user_id] = {
+                "user_id": user_id,
+                "status": "active",
+                "first_seen": now,
+                "last_seen": now,
+                "message_count": 0,
+                "error_count": 0,
+                "note": "",
+            }
+        users[user_id]["last_seen"] = now
+
+
+def increment_user_stat(user_id: str, field: str, amount: int = 1):
+    if not user_id or user_id == "admin":
+        return
+    with users_lock:
+        if user_id in users:
+            users[user_id][field] = users[user_id].get(field, 0) + amount
+
+
+def is_user_allowed(user_id: str) -> bool:
+    """Check if a user is allowed to use the bot."""
+    if not user_id or user_id == "admin":
+        return True
+    with users_lock:
+        u = users.get(user_id)
+        if u and u.get("status") == "blocked":
+            return False
+    return True
+
+
+def get_user_summary(user_id: str) -> dict:
+    """Get user info + recent activity from events."""
+    with users_lock:
+        u = dict(users.get(user_id, {}))
+    if not u:
+        u = {"user_id": user_id, "status": "unknown"}
+
+    # Compute live stats from events
+    with events_lock:
+        user_events = [e for e in events if e.get("user_id") == user_id]
+
+    u["total_events"] = len(user_events)
+    u["total_chats"] = sum(1 for e in user_events if e["type"] == "chat")
+    u["total_queries"] = sum(1 for e in user_events if e["type"] == "query")
+    u["total_errors"] = sum(1 for e in user_events if e["type"] == "error")
+    u["recent_events"] = user_events[-20:]  # last 20
+    return u
+
+
+# ---------------------------------------------------------------------------
+# Event persistence
 # ---------------------------------------------------------------------------
 def load_events():
     global events
@@ -123,6 +209,18 @@ def load_events():
                 except json.JSONDecodeError:
                     continue
     events = loaded[-MAX_EVENTS:]
+
+
+def rebuild_users_from_events():
+    """Rebuild user stats from loaded events (on startup)."""
+    for evt in events:
+        uid = evt.get("user_id")
+        if uid and uid != "admin":
+            touch_user(uid)
+            if evt.get("type") == "chat":
+                increment_user_stat(uid, "message_count")
+            elif evt.get("type") == "error":
+                increment_user_stat(uid, "error_count")
 
 
 def append_event_to_file(evt: dict):
@@ -159,22 +257,30 @@ def clear_all_events():
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(EVENTS_FILE, "w", encoding="utf-8") as f:
-            pass  # truncate
+            pass
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# Ingest + broadcast helper
+# Ingest + broadcast
 # ---------------------------------------------------------------------------
 def ingest_event(evt: dict) -> dict:
-    """Add event to memory, persist, broadcast. Returns the event."""
     if "id" not in evt:
         evt["id"] = str(uuid.uuid4())
     if "timestamp" not in evt:
         evt["timestamp"] = time.time()
     if "type" not in evt:
         evt["type"] = "system"
+
+    # Track user
+    uid = evt.get("user_id")
+    if uid:
+        touch_user(uid)
+        if evt["type"] == "chat":
+            increment_user_stat(uid, "message_count")
+        elif evt["type"] == "error":
+            increment_user_stat(uid, "error_count")
 
     with events_lock:
         events.append(evt)
@@ -183,6 +289,11 @@ def ingest_event(evt: dict) -> dict:
 
     append_event_to_file(evt)
     broadcast_event(evt)
+
+    # Save users periodically (every 10th event to avoid thrashing)
+    if len(events) % 10 == 0:
+        save_users()
+
     return evt
 
 
@@ -190,7 +301,6 @@ def ingest_event(evt: dict) -> dict:
 # Ollama proxy
 # ---------------------------------------------------------------------------
 def call_ollama(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
-    """Call Ollama chat API. Returns (answer, duration_ms)."""
     with config_lock:
         ollama_url = config["ollama_url"]
 
@@ -206,10 +316,8 @@ def call_ollama(question: str, model: str, system_prompt: str, temperature: floa
     start = time.time()
     data = json.dumps(body).encode("utf-8")
     req = Request(
-        f"{ollama_url}/api/chat",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        f"{ollama_url}/api/chat", data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
     )
     resp = urlopen(req, timeout=120)
     result = json.loads(resp.read())
@@ -219,7 +327,6 @@ def call_ollama(question: str, model: str, system_prompt: str, temperature: floa
 
 
 def list_ollama_models() -> list[dict]:
-    """Fetch available models from Ollama."""
     with config_lock:
         ollama_url = config["ollama_url"]
     try:
@@ -233,7 +340,7 @@ def list_ollama_models() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Stats engine
+# Stats
 # ---------------------------------------------------------------------------
 def compute_stats() -> dict:
     with events_lock:
@@ -287,12 +394,18 @@ def compute_stats() -> dict:
     for e in evts:
         type_counts[e.get("type", "unknown")] += 1
 
+    with users_lock:
+        blocked_count = sum(1 for u in users.values() if u.get("status") == "blocked")
+        total_users = len(users)
+
     return {
         "total_events": total,
         "total_chats": len(chats),
         "total_queries": len(queries),
         "total_errors": len(errors),
         "active_users": len(recent_users),
+        "total_users": total_users,
+        "blocked_users": blocked_count,
         "messages_last_hour": recent_msgs,
         "avg_response_ms": round(avg_response, 1),
         "avg_query_ms": round(avg_query, 1),
@@ -356,7 +469,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
 
-    # ----- POST endpoints -----
+    # ----- POST -----
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -372,6 +485,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         if path.startswith("/api/moderate/"):
             event_id = path.split("/api/moderate/", 1)[1]
             return self._handle_moderate(event_id)
+        if path.startswith("/api/users/"):
+            return self._handle_user_action(path)
 
         self._send_json({"error": "Not found"}, 404)
 
@@ -383,11 +498,16 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, 400)
             return
 
+        # Check if user is blocked
+        uid = evt.get("user_id", "")
+        if uid and not is_user_allowed(uid):
+            self._send_json({"error": "user_blocked", "user_id": uid}, 403)
+            return
+
         evt = ingest_event(evt)
         self._send_json({"ok": True, "id": evt["id"]})
 
     def _handle_chat(self):
-        """Proxy chat to Ollama: receive question, call LLM, log + return answer."""
         try:
             body = self._read_body()
             data = json.loads(body)
@@ -400,42 +520,36 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "question is required"}, 400)
             return
 
+        user_id = data.get("user_id", "admin")
+
+        # Check if user is blocked
+        if not is_user_allowed(user_id):
+            self._send_json({"error": "user_blocked", "user_id": user_id}, 403)
+            return
+
         with config_lock:
             model = data.get("model") or config["default_model"]
             system_prompt = data.get("system_prompt", config["system_prompt"])
             temperature = data.get("temperature", config["temperature"])
 
-        user_id = data.get("user_id", "admin")
-
         try:
             answer, duration_ms = call_ollama(question, model, system_prompt, temperature)
         except Exception as e:
-            # Log the error
             ingest_event({
-                "type": "error",
-                "message": str(e),
-                "error_type": "ollama_error",
-                "user_id": user_id,
+                "type": "error", "message": str(e),
+                "error_type": "ollama_error", "user_id": user_id,
             })
             self._send_json({"error": str(e)}, 502)
             return
 
-        # Log the chat event
         evt = ingest_event({
-            "type": "chat",
-            "user_id": user_id,
-            "question": question,
-            "answer": answer,
-            "duration_ms": duration_ms,
-            "model": model,
+            "type": "chat", "user_id": user_id, "question": question,
+            "answer": answer, "duration_ms": duration_ms, "model": model,
         })
 
         self._send_json({
-            "ok": True,
-            "id": evt["id"],
-            "answer": answer,
-            "duration_ms": duration_ms,
-            "model": model,
+            "ok": True, "id": evt["id"], "answer": answer,
+            "duration_ms": duration_ms, "model": model,
         })
 
     def _handle_clear(self):
@@ -480,14 +594,64 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
         persist_moderation(event_id, mod)
         broadcast_event({
-            "type": "_moderation_update",
-            "event_id": event_id,
-            "moderation": mod,
-            "timestamp": time.time(),
+            "type": "_moderation_update", "event_id": event_id,
+            "moderation": mod, "timestamp": time.time(),
         })
         self._send_json({"ok": True, "moderation": mod})
 
-    # ----- GET endpoints -----
+    def _handle_user_action(self, path: str):
+        """POST /api/users/<id>/block | /api/users/<id>/unblock | /api/users/<id>/update"""
+        parts = path.split("/api/users/", 1)[1].split("/")
+        if len(parts) < 2:
+            self._send_json({"error": "Invalid path"}, 400)
+            return
+
+        user_id = parts[0]
+        action = parts[1]
+
+        if action == "block":
+            with users_lock:
+                if user_id in users:
+                    users[user_id]["status"] = "blocked"
+                else:
+                    users[user_id] = {
+                        "user_id": user_id, "status": "blocked",
+                        "first_seen": time.time(), "last_seen": time.time(),
+                        "message_count": 0, "error_count": 0, "note": "",
+                    }
+            save_users()
+            broadcast_event({"type": "_user_update", "user_id": user_id, "status": "blocked"})
+            self._send_json({"ok": True, "user_id": user_id, "status": "blocked"})
+
+        elif action == "unblock":
+            with users_lock:
+                if user_id in users:
+                    users[user_id]["status"] = "active"
+            save_users()
+            broadcast_event({"type": "_user_update", "user_id": user_id, "status": "active"})
+            self._send_json({"ok": True, "user_id": user_id, "status": "active"})
+
+        elif action == "update":
+            try:
+                body = self._read_body()
+                data = json.loads(body)
+            except (json.JSONDecodeError, Exception) as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            with users_lock:
+                if user_id in users:
+                    if "note" in data:
+                        users[user_id]["note"] = str(data["note"])
+                    if "status" in data and data["status"] in ("active", "blocked", "restricted"):
+                        users[user_id]["status"] = data["status"]
+            save_users()
+            with users_lock:
+                self._send_json({"ok": True, "user": users.get(user_id, {})})
+
+        else:
+            self._send_json({"error": "Unknown action"}, 400)
+
+    # ----- GET -----
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -508,8 +672,22 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return self._handle_models()
         if path == "/api/config":
             return self._handle_get_config()
+        if path == "/api/users":
+            return self._handle_get_users()
+        if path.startswith("/api/users/") and path.count("/") == 3:
+            # GET /api/users/<id>
+            user_id = path.split("/api/users/", 1)[1].rstrip("/")
+            return self._handle_get_user(user_id)
+        if path.startswith("/api/users/") and path.endswith("/check"):
+            user_id = path.split("/api/users/", 1)[1].replace("/check", "")
+            allowed = is_user_allowed(user_id)
+            return self._send_json({"user_id": user_id, "allowed": allowed})
         if path == "/api/health":
-            return self._send_json({"status": "ok", "events": len(events), "uptime_s": round(time.time() - SERVER_START)})
+            return self._send_json({
+                "status": "ok", "events": len(events),
+                "users": len(users),
+                "uptime_s": round(time.time() - SERVER_START),
+            })
 
         self._serve_static(path)
 
@@ -565,6 +743,12 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self.wfile.write(f"event: moderation\ndata: {mod_data}\n\n".encode())
             self.wfile.flush()
 
+            # Send users state
+            with users_lock:
+                users_data = json.dumps(users, ensure_ascii=False)
+            self.wfile.write(f"event: users\ndata: {users_data}\n\n".encode())
+            self.wfile.flush()
+
             while True:
                 try:
                     data = q.get(timeout=15)
@@ -602,12 +786,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         total = len(filtered)
         page = filtered[offset:offset + limit]
 
-        with moderation_lock:
-            for e in page:
-                mod = moderation.get(e["id"])
-                if mod:
-                    e = {**e, "_moderation": mod}
-
         self._send_json({"total": total, "events": page})
 
     def _handle_conversations(self, params: dict):
@@ -619,8 +797,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             uid = c.get("user_id", "anonymous")
             if uid not in convos:
                 convos[uid] = {
-                    "user_id": uid,
-                    "message_count": 0,
+                    "user_id": uid, "message_count": 0,
                     "first_message": c.get("timestamp", 0),
                     "last_message": c.get("timestamp", 0),
                     "messages": [],
@@ -647,6 +824,24 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         with config_lock:
             self._send_json({"config": dict(config)})
 
+    def _handle_get_users(self):
+        with users_lock:
+            user_list = list(users.values())
+        # Enrich with live event counts
+        with events_lock:
+            for u in user_list:
+                uid = u["user_id"]
+                user_evts = [e for e in events if e.get("user_id") == uid]
+                u["total_events"] = len(user_evts)
+                u["total_chats"] = sum(1 for e in user_evts if e["type"] == "chat")
+                u["total_errors"] = sum(1 for e in user_evts if e["type"] == "error")
+
+        user_list.sort(key=lambda x: -x.get("last_seen", 0))
+        self._send_json({"users": user_list})
+
+    def _handle_get_user(self, user_id: str):
+        self._send_json({"user": get_user_summary(user_id)})
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -662,17 +857,20 @@ SERVER_START = time.time()
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_config()
+    load_users()
     load_events()
-    print(f"[chatbot-monitor] Loaded {len(events)} events from {EVENTS_FILE}")
+    rebuild_users_from_events()
+    save_users()
+    print(f"[chatbot-monitor] Loaded {len(events)} events, {len(users)} users")
     print(f"[chatbot-monitor] Ollama: {config['ollama_url']}  Model: {config['default_model']}")
 
     server = ThreadedHTTPServer(("0.0.0.0", PORT), MonitorHandler)
-    print(f"[chatbot-monitor] Server running on http://localhost:{PORT}")
     print(f"[chatbot-monitor] Dashboard: http://localhost:{PORT}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[chatbot-monitor] Shutting down...")
+        save_users()
         server.shutdown()
 
 

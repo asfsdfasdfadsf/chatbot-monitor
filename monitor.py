@@ -26,6 +26,11 @@ Auto-connects to localhost:7779 — no configuration needed for local setups.
 === DB WRAPPER ===
 
     rows, ms = monitor.db_query(cursor, "SELECT * FROM articles WHERE id=?", (4711,))
+
+=== CHECK IF USER IS BLOCKED ===
+
+    if not monitor.is_user_allowed("user123"):
+        return "You have been blocked by an administrator."
 """
 
 import json
@@ -61,6 +66,27 @@ def enable():
     """Re-enable monitoring."""
     global _enabled
     _enabled = True
+
+
+def is_user_allowed(user_id: str) -> bool:
+    """Check if a user is allowed to use the bot (not blocked by admin).
+
+    Returns True if allowed, False if blocked. Returns True on any error
+    (fail-open) so the chatbot keeps working if the monitor is down.
+
+    Usage:
+        if not monitor.is_user_allowed("user123"):
+            return "You have been blocked."
+    """
+    if not _enabled:
+        return True
+    try:
+        req = Request(f"{_server_url}/api/users/{user_id}/check", method="GET")
+        resp = urlopen(req, timeout=2)
+        data = json.loads(resp.read())
+        return data.get("allowed", True)
+    except Exception:
+        return True  # fail-open: if monitor is down, allow the user
 
 
 # ---------------------------------------------------------------------------
