@@ -717,8 +717,62 @@ def main():
     dead_cookie = login("deleteme", "deleteme")
     test("Deleted user cannot login", dead_cookie == "")
 
+    # ---- Provider config ----
+    print("\n[19] Provider config (multi-LLM)")
+
+    # Default provider is ollama
+    cfg = get("/api/config")
+    test("Default provider is ollama", cfg["config"].get("provider") == "ollama")
+    test("Config has openai_api_key field", "openai_api_key" in cfg["config"])
+    test("Config has anthropic_api_key field", "anthropic_api_key" in cfg["config"])
+    test("Config has openai_base_url field", "openai_base_url" in cfg["config"])
+
+    # Set provider to openai with API key
+    post("/api/config", {
+        "provider": "openai",
+        "openai_api_key": "sk-test-1234567890abcdef",
+        "openai_base_url": "https://api.openai.com/v1",
+    })
+    cfg2 = get("/api/config")
+    test("Provider changed to openai", cfg2["config"]["provider"] == "openai")
+    test("OpenAI API key is masked", cfg2["config"]["openai_api_key"].startswith("..."))
+    test("OpenAI key shows last 4 chars", cfg2["config"]["openai_api_key"] == "...cdef")
+    test("OpenAI base URL saved", cfg2["config"]["openai_base_url"] == "https://api.openai.com/v1")
+
+    # Sending masked key back should NOT overwrite the real key
+    post("/api/config", {"openai_api_key": "...cdef"})
+    # Verify by reading config file directly
+    from pathlib import Path
+    cfg_raw = json.loads((Path(__file__).parent / "data" / "config.json").read_text())
+    test("Masked key not saved over real key", cfg_raw["openai_api_key"] == "sk-test-1234567890abcdef")
+
+    # Set provider to anthropic
+    post("/api/config", {
+        "provider": "anthropic",
+        "anthropic_api_key": "sk-ant-testkey9876",
+    })
+    cfg3 = get("/api/config")
+    test("Provider changed to anthropic", cfg3["config"]["provider"] == "anthropic")
+    test("Anthropic key masked", cfg3["config"]["anthropic_api_key"] == "...9876")
+
+    # Model list changes with provider
+    # Anthropic should return hardcoded models
+    models_ant = get("/api/models")
+    test("Anthropic models returned", len(models_ant["models"]) > 0)
+    test("Claude model in list", any("claude" in m["name"] for m in models_ant["models"]))
+
+    # Switch back to ollama for remaining tests
+    post("/api/config", {
+        "provider": "ollama",
+        "default_model": "llama3:8b",
+        "openai_api_key": "",
+        "anthropic_api_key": "",
+    })
+    cfg4 = get("/api/config")
+    test("Provider back to ollama", cfg4["config"]["provider"] == "ollama")
+
     # ---- Users persistence ----
-    print("\n[19] Users persistence")
+    print("\n[20] Users persistence")
     from pathlib import Path
     users_file = Path(__file__).parent / "data" / "users.json"
     test("Users file exists", users_file.exists())
@@ -727,7 +781,7 @@ def main():
         test("Users file has data", len(users_data) >= 2, f"got {len(users_data)} users")
 
     # ---- Persistence ----
-    print("\n[20] JSONL persistence")
+    print("\n[21] JSONL persistence")
     jsonl = Path(__file__).parent / "data" / "events.jsonl"
     lines = jsonl.read_text(encoding="utf-8").strip().split("\n")
     test("JSONL file has events", len(lines) >= 10, f"got {len(lines)} lines")
@@ -751,7 +805,7 @@ def main():
         test("Accounts file has admin", "admin" in acct_data)
 
     # ---- SSE ----
-    print("\n[21] SSE stream (GET /api/stream)")
+    print("\n[22] SSE stream (GET /api/stream)")
     import urllib.request
     req = urllib.request.Request(f"{BASE}/api/stream")
     req.add_header("Cookie", ADMIN_COOKIE)
@@ -763,7 +817,7 @@ def main():
     resp.close()
 
     # ---- Static files ----
-    print("\n[22] Static file serving")
+    print("\n[23] Static file serving")
     req = urllib.request.Request(f"{BASE}/")
     resp = urllib.request.urlopen(req, timeout=5)
     html = resp.read().decode()
@@ -779,7 +833,7 @@ def main():
     resp.close()
 
     # ---- Final clear ----
-    print("\n[23] Final cleanup")
+    print("\n[24] Final cleanup")
     r = post("/api/clear", {})
     test("Final clear works", r.get("ok") is True)
     h = get("/api/health", cookie="")

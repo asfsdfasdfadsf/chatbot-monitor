@@ -308,7 +308,21 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 <div class="modal" id="settingsModal" onclick="if(event.target===this)closeSettings()">
   <div class="mbox">
     <h2>Chatbot Settings</h2>
-    <div class="mf"><label>Ollama URL</label><input id="cfgUrl" value="http://localhost:11434"></div>
+    <div class="mf"><label>LLM Provider</label>
+      <select id="cfgProvider" onchange="onProviderChange()">
+        <option value="ollama">Ollama (Local)</option>
+        <option value="openai">OpenAI (ChatGPT)</option>
+        <option value="anthropic">Anthropic (Claude)</option>
+      </select>
+    </div>
+    <div class="mf" id="cfgOllamaRow"><label>Ollama URL</label><input id="cfgUrl" value="http://localhost:11434"></div>
+    <div class="mf" id="cfgOpenaiKeyRow" style="display:none"><label>OpenAI API Key</label>
+      <div style="display:flex;gap:4px"><input id="cfgOpenaiKey" type="password" placeholder="sk-..." style="flex:1"><button class="mbtn" style="font-size:10px;white-space:nowrap" onclick="toggleKeyVis('cfgOpenaiKey',this)">Show</button></div>
+    </div>
+    <div class="mf" id="cfgOpenaiUrlRow" style="display:none"><label>OpenAI Base URL</label><input id="cfgOpenaiUrl" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1"></div>
+    <div class="mf" id="cfgAnthropicKeyRow" style="display:none"><label>Anthropic API Key</label>
+      <div style="display:flex;gap:4px"><input id="cfgAnthropicKey" type="password" placeholder="sk-ant-..." style="flex:1"><button class="mbtn" style="font-size:10px;white-space:nowrap" onclick="toggleKeyVis('cfgAnthropicKey',this)">Show</button></div>
+    </div>
     <div class="mf"><label>Default Model</label><select id="cfgModel"><option>loading...</option></select></div>
     <div class="mf"><label>System Prompt</label><textarea id="cfgPrompt" placeholder="e.g. Du bist ein WaWi-Assistent."></textarea></div>
     <div class="mf"><label>Temperature</label><input id="cfgTemp" type="number" min="0" max="2" step="0.1" value="0.7"></div>
@@ -442,7 +456,7 @@ async function sendChat(){
 }
 function renderChatMsgs(){
   const c=$('chatMessages');
-  if(!chatHistory.length){c.innerHTML='<div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Messages go to your local Ollama</div></div>';return}
+  if(!chatHistory.length){const prov=(appCfg.provider||'ollama').charAt(0).toUpperCase()+(appCfg.provider||'ollama').slice(1);c.innerHTML=`<div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Provider: ${esc(prov)}</div></div>`;return}
   c.innerHTML=chatHistory.map(m=>{
     if(m.role==='user')return`<div class="bubble q"><div class="bl">You</div>${esc(m.content)}</div>`;
     if(m.role==='error')return`<div class="bubble a" style="border-color:var(--red)"><div class="bl" style="color:var(--red)">Error</div>${esc(m.content)}</div>`;
@@ -667,10 +681,63 @@ function saveNote(){if(!selectedId)return;postMod(selectedId,{note:$('noteIn').v
 function postMod(id,d){fetch(`/api/moderate/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).catch(()=>{})}
 
 // ---- Settings ----
+let _loadedOpenaiKey='',_loadedAnthropicKey=''; // track masked values from server
 function openSettings(){loadCfg();$('settingsModal').classList.add('open')}
 function closeSettings(){$('settingsModal').classList.remove('open')}
-async function loadCfg(){try{const r=await fetch('/api/config');if(!r.ok)return;const d=await r.json();appCfg=d.config;$('cfgUrl').value=appCfg.ollama_url||'http://localhost:11434';$('cfgPrompt').value=appCfg.system_prompt||'';$('cfgTemp').value=appCfg.temperature??0.7;await loadModels();$('cfgModel').value=appCfg.default_model||''}catch(e){}}
-async function saveSettings(){const c={ollama_url:$('cfgUrl').value,default_model:$('cfgModel').value,system_prompt:$('cfgPrompt').value,temperature:parseFloat($('cfgTemp').value)||0.7};await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});appCfg=c;closeSettings()}
+function onProviderChange(){
+  const p=$('cfgProvider').value;
+  $('cfgOllamaRow').style.display=p==='ollama'?'':'none';
+  $('cfgOpenaiKeyRow').style.display=p==='openai'?'':'none';
+  $('cfgOpenaiUrlRow').style.display=p==='openai'?'':'none';
+  $('cfgAnthropicKeyRow').style.display=p==='anthropic'?'':'none';
+  // Reload models for new provider after saving
+}
+function toggleKeyVis(id,btn){
+  const inp=$(id);
+  if(inp.type==='password'){inp.type='text';btn.textContent='Hide'}
+  else{inp.type='password';btn.textContent='Show'}
+}
+async function loadCfg(){
+  try{
+    const r=await fetch('/api/config');if(!r.ok)return;
+    const d=await r.json();appCfg=d.config;
+    $('cfgProvider').value=appCfg.provider||'ollama';
+    $('cfgUrl').value=appCfg.ollama_url||'http://localhost:11434';
+    $('cfgOpenaiUrl').value=appCfg.openai_base_url||'https://api.openai.com/v1';
+    // API keys come masked from server (e.g. "...abcd")
+    _loadedOpenaiKey=appCfg.openai_api_key||'';
+    _loadedAnthropicKey=appCfg.anthropic_api_key||'';
+    $('cfgOpenaiKey').value=_loadedOpenaiKey;
+    $('cfgAnthropicKey').value=_loadedAnthropicKey;
+    $('cfgPrompt').value=appCfg.system_prompt||'';
+    $('cfgTemp').value=appCfg.temperature??0.7;
+    onProviderChange();
+    await loadModels();
+    $('cfgModel').value=appCfg.default_model||'';
+  }catch(e){}
+}
+async function saveSettings(){
+  const provider=$('cfgProvider').value;
+  const c={
+    provider:provider,
+    ollama_url:$('cfgUrl').value,
+    default_model:$('cfgModel').value,
+    system_prompt:$('cfgPrompt').value,
+    temperature:parseFloat($('cfgTemp').value)||0.7,
+    openai_base_url:$('cfgOpenaiUrl').value,
+  };
+  // Only send API key if user changed it (not the masked value)
+  const okey=$('cfgOpenaiKey').value;
+  if(okey&&okey!==_loadedOpenaiKey)c.openai_api_key=okey;
+  const akey=$('cfgAnthropicKey').value;
+  if(akey&&akey!==_loadedAnthropicKey)c.anthropic_api_key=akey;
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+  const d=await r.json();
+  if(d.config)appCfg=d.config;
+  closeSettings();
+  // Reload models for possibly new provider
+  await loadModels();
+}
 async function loadModels(){try{const r=await fetch('/api/models');if(!r.ok)return;ollamaModels=(await r.json()).models||[]}catch(e){ollamaModels=[]}populateModels()}
 function populateModels(){[$('modelSel'),$('cfgModel')].forEach(s=>{if(!s)return;const c=s.value;s.innerHTML='';if(!ollamaModels.length){s.innerHTML='<option value="">No models found</option>';return}ollamaModels.forEach(m=>{const o=document.createElement('option');o.value=m.name;o.textContent=m.name;s.appendChild(o)});if(c&&ollamaModels.some(m=>m.name===c))s.value=c;else if(appCfg.default_model)s.value=appCfg.default_model})}
 function clearEvents(){if(!confirm('Clear all events? This cannot be undone.'))return;fetch('/api/clear',{method:'POST'})}

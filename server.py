@@ -40,11 +40,15 @@ ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 PUBLIC_DIR = Path(__file__).resolve().parent / "public"
 
 config = {
+    "provider": "ollama",  # "ollama" | "openai" | "anthropic"
     "ollama_url": "http://localhost:11434",
     "default_model": "llama3:8b",
     "system_prompt": "",
     "temperature": 0.7,
     "bot_enabled": True,
+    "openai_api_key": "",
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_api_key": "",
 }
 config_lock = threading.Lock()
 
@@ -414,7 +418,7 @@ def ingest_event(evt: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Ollama proxy
+# LLM providers
 # ---------------------------------------------------------------------------
 def call_ollama(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
     with config_lock:
@@ -442,17 +446,147 @@ def call_ollama(question: str, model: str, system_prompt: str, temperature: floa
     return answer, round(duration_ms, 1)
 
 
-def list_ollama_models() -> list[dict]:
+def call_openai(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
     with config_lock:
-        ollama_url = config["ollama_url"]
-    try:
-        req = Request(f"{ollama_url}/api/tags", method="GET")
-        resp = urlopen(req, timeout=5)
-        data = json.loads(resp.read())
-        models = data.get("models", [])
-        return [{"name": m["name"], "size": m.get("size", 0)} for m in models]
-    except Exception:
-        return []
+        api_key = config["openai_api_key"]
+        base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+
+    if not api_key:
+        raise ValueError("OpenAI API key not configured")
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": question})
+
+    body = {"model": model, "messages": messages}
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        f"{base_url}/chat/completions", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    answer = result["choices"][0]["message"]["content"]
+    duration_ms = (time.time() - start) * 1000
+    return answer, round(duration_ms, 1)
+
+
+def call_anthropic(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+    with config_lock:
+        api_key = config["anthropic_api_key"]
+
+    if not api_key:
+        raise ValueError("Anthropic API key not configured")
+
+    body: dict = {
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": question}],
+    }
+    if system_prompt:
+        body["system"] = system_prompt
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        "https://api.anthropic.com/v1/messages", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    answer = result["content"][0]["text"]
+    duration_ms = (time.time() - start) * 1000
+    return answer, round(duration_ms, 1)
+
+
+def call_llm(question: str, model: str, system_prompt: str, temperature: float) -> tuple[str, float]:
+    """Dispatch to the configured LLM provider."""
+    with config_lock:
+        provider = config.get("provider", "ollama")
+    if provider == "openai":
+        return call_openai(question, model, system_prompt, temperature)
+    elif provider == "anthropic":
+        return call_anthropic(question, model, system_prompt, temperature)
+    else:
+        return call_ollama(question, model, system_prompt, temperature)
+
+
+OPENAI_MODELS = [
+    {"name": "gpt-4o", "size": 0},
+    {"name": "gpt-4o-mini", "size": 0},
+    {"name": "gpt-4-turbo", "size": 0},
+    {"name": "gpt-4", "size": 0},
+    {"name": "gpt-3.5-turbo", "size": 0},
+    {"name": "o3-mini", "size": 0},
+]
+
+ANTHROPIC_MODELS = [
+    {"name": "claude-sonnet-4-20250514", "size": 0},
+    {"name": "claude-haiku-4-5-20251001", "size": 0},
+    {"name": "claude-3-5-sonnet-20241022", "size": 0},
+    {"name": "claude-3-5-haiku-20241022", "size": 0},
+    {"name": "claude-3-opus-20240229", "size": 0},
+]
+
+
+def list_models() -> list[dict]:
+    with config_lock:
+        provider = config.get("provider", "ollama")
+
+    if provider == "openai":
+        with config_lock:
+            api_key = config["openai_api_key"]
+            base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+        if not api_key:
+            return OPENAI_MODELS  # fallback list
+        try:
+            req = Request(
+                f"{base_url}/models", method="GET",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp = urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+            models = data.get("data", [])
+            # Filter to chat models
+            chat_models = [
+                {"name": m["id"], "size": 0}
+                for m in models
+                if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "o4"))
+            ]
+            return sorted(chat_models, key=lambda x: x["name"]) if chat_models else OPENAI_MODELS
+        except Exception:
+            return OPENAI_MODELS
+
+    elif provider == "anthropic":
+        return ANTHROPIC_MODELS
+
+    else:  # ollama
+        with config_lock:
+            ollama_url = config["ollama_url"]
+        try:
+            req = Request(f"{ollama_url}/api/tags", method="GET")
+            resp = urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+            models = data.get("models", [])
+            return [{"name": m["name"], "size": m.get("size", 0)} for m in models]
+        except Exception:
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +945,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             temperature = data.get("temperature", config["temperature"])
 
         try:
-            answer, duration_ms = call_ollama(question, model, system_prompt, temperature)
+            answer, duration_ms = call_llm(question, model, system_prompt, temperature)
         except Exception as e:
             ingest_event({
                 "type": "error", "message": str(e),
@@ -844,9 +978,16 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return
 
         with config_lock:
-            for key in ("ollama_url", "default_model", "system_prompt", "temperature"):
+            for key in ("ollama_url", "default_model", "system_prompt", "temperature",
+                        "provider", "openai_base_url"):
                 if key in data:
                     config[key] = data[key]
+            # Only update API keys if a real value is sent (not masked); allow empty to clear
+            for key in ("openai_api_key", "anthropic_api_key"):
+                if key in data and not str(data[key]).startswith("..."):
+                    config[key] = data[key]
+            if "provider" in data and data["provider"] in ("ollama", "openai", "anthropic"):
+                config["provider"] = data["provider"]
             if "bot_enabled" in data:
                 config["bot_enabled"] = bool(data["bot_enabled"])
         save_config()
@@ -1272,12 +1413,20 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"moderation": dict(moderation)})
 
     def _handle_models(self):
-        models = list_ollama_models()
+        models = list_models()
         self._send_json({"models": models})
 
     def _handle_get_config(self):
         with config_lock:
-            self._send_json({"config": dict(config)})
+            cfg = dict(config)
+        # Mask API keys — show only last 4 chars
+        for key in ("openai_api_key", "anthropic_api_key"):
+            val = cfg.get(key, "")
+            if val:
+                cfg[key] = "..." + val[-4:]
+            else:
+                cfg[key] = ""
+        self._send_json({"config": cfg})
 
     def _handle_get_users(self):
         with users_lock:

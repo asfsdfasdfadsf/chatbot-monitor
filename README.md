@@ -5,20 +5,23 @@ Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL que
 ## Architecture
 
 ```
-Users → Web Chat → FastAPI Chatbot → Ollama (localhost:11434)
-                        ↓ (import monitor)
-              Admin Dashboard (localhost:7779)
+Users → Web Chat → FastAPI Chatbot → LLM Provider
+                        ↓ (import monitor)       ↑
+              Admin Dashboard (localhost:7779) ───┘
                   ↓ (cookie auth, roles)
-            Admin: full control
-            User: chat + own events
+            Admin: full control        Providers:
+            User: chat + own events    • Ollama (local)
+                                       • OpenAI (ChatGPT)
+                                       • Anthropic (Claude)
 ```
 
 Everything runs on localhost — zero config, zero dependencies, just import and go.
 
 ## Features
 
+- **Multi-provider LLM** — switch between Ollama (local), OpenAI (ChatGPT), and Anthropic (Claude)
 - **Live event feed** — chat, query, error, and system events in real-time via SSE
-- **Built-in chat** — proxy questions to Ollama directly from the dashboard
+- **Built-in chat** — proxy questions to any configured LLM provider from the dashboard
 - **SQL inspector** — syntax-highlighted queries with result tables
 - **Moderation** — flag, review, and annotate chat events
 - **User management** — block/unblock chatbot end-users, set priorities
@@ -140,6 +143,22 @@ Admins can globally disable the bot via the dashboard or config API. When disabl
 - `POST /api/chat` returns 503
 - `GET /api/users/<id>/check` reports `bot_enabled: false`
 - SDK `get_user_status()` reflects the disabled state
+
+## LLM Providers
+
+The dashboard supports three LLM providers, configurable in Settings:
+
+| Provider | Models | Auth |
+|----------|--------|------|
+| **Ollama** (default) | Any local model (llama3, mistral, etc.) | No key needed |
+| **OpenAI** | GPT-4o, GPT-4, GPT-3.5-turbo, o3-mini, etc. | API key required |
+| **Anthropic** | Claude Sonnet 4, Claude Haiku 4.5, Claude 3.5 Sonnet, etc. | API key required |
+
+**Setup**: Go to Settings (admin only) → select provider → enter API key → select model → Save.
+
+**OpenAI-compatible providers**: The OpenAI Base URL can be changed to use compatible APIs like Groq (`https://api.groq.com/openai/v1`), Together.ai, Azure OpenAI, or any OpenAI-compatible endpoint.
+
+**API key security**: Keys are stored in `data/config.json` on disk. The `GET /api/config` endpoint returns masked keys (e.g. `...abcd`) — full keys are never sent to the browser.
 
 ## Wrappers (auto-log everything)
 
@@ -326,8 +345,12 @@ Default: everything on localhost, zero config needed.
 
 | Setting | Default | Override |
 |---------|---------|----------|
+| LLM Provider | `ollama` | Dashboard settings (`"ollama"`, `"openai"`, `"anthropic"`) |
 | Monitor server | `localhost:7779` | `monitor.init("http://other:7779")` |
-| Ollama | `localhost:11434` | Dashboard settings or `monitor.ollama_chat(..., ollama_url="...")` |
+| Ollama URL | `localhost:11434` | Dashboard settings or `monitor.ollama_chat(..., ollama_url="...")` |
+| OpenAI API key | (empty) | Dashboard settings |
+| OpenAI Base URL | `https://api.openai.com/v1` | Dashboard settings (change for Groq, Azure, etc.) |
+| Anthropic API key | (empty) | Dashboard settings |
 | Default model | `llama3:8b` | Dashboard settings |
 | System prompt | (empty) | Dashboard settings |
 | Temperature | `0.7` | Dashboard settings |
@@ -358,7 +381,7 @@ python server.py
 python test_all.py
 ```
 
-The test suite covers 166 tests across 23 sections: server connectivity, authentication, role-based access control, event ingestion, event queries, conversations, stats, moderation, config, Ollama chat, SDK, user management, user permissions, user status, priorities, bot toggle, account management, persistence, SSE streaming, and static file serving.
+The test suite covers 180 tests across 24 sections: server connectivity, authentication, role-based access control, event ingestion, event queries, conversations, stats, moderation, config, Ollama chat, SDK, user management, user permissions, user status, priorities, bot toggle, account management, persistence, SSE streaming, and static file serving.
 
 ## Zero Dependencies
 
@@ -371,4 +394,4 @@ Both `server.py` and `monitor.py` use only Python stdlib. No pip install needed.
 | `server.py` | HTTP server: auth, events, SSE, Ollama proxy, user/account management |
 | `monitor.py` | Python SDK: fire-and-forget logging, wrappers, middleware |
 | `public/index.html` | Dashboard UI: login, chat, feed, stats, admin panels |
-| `test_all.py` | Comprehensive test suite (166 tests) |
+| `test_all.py` | Comprehensive test suite (180 tests) |
