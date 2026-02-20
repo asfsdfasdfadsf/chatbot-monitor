@@ -270,7 +270,13 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       <div id="tChat" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
         <div class="cmsg" id="chatMessages"><div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Messages go to your local Ollama</div></div></div>
         <div class="cinput">
+          <div id="chatFilePreview" style="display:none;padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;margin-bottom:4px;font-size:11px;color:var(--text-dim)">
+            <span id="chatFileName"></span>
+            <button onclick="clearChatFile()" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:13px;margin-left:6px" title="Datei entfernen">&times;</button>
+          </div>
           <div class="crow">
+            <input type="file" id="chatFileInput" accept=".txt,.md,.csv,.json,.log,.xlsx,.xls" style="display:none" onchange="onChatFileSelected(this)">
+            <button onclick="$('chatFileInput').click()" title="Datei anhängen" style="min-height:38px;padding:8px 10px;font-size:16px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text-dim);cursor:pointer">&#128206;</button>
             <textarea class="cin" id="chatInput" rows="1" placeholder="Type a message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
             <button class="csend" id="chatSendBtn" onclick="sendChat()">Send</button>
             <button class="hbtn" id="newChatBtn" onclick="newChat()" title="Clear conversation history and start fresh" style="min-height:38px;padding:8px 12px;font-size:12px">New Chat</button>
@@ -336,7 +342,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
           <div class="sc admin-only" style="padding:10px">
             <div class="sl">Upload Document</div>
             <div style="margin-top:8px">
-              <input type="file" id="kbFileInput" accept=".txt,.md,.csv,.json,.log" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;display:block;width:100%">
+              <input type="file" id="kbFileInput" accept=".txt,.md,.csv,.json,.log,.xlsx,.xls" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;display:block;width:100%">
               <button class="mbtn" onclick="uploadKbFile()" style="font-size:11px;width:100%;margin-top:4px">Upload File</button>
             </div>
             <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
@@ -569,22 +575,40 @@ function cTab(t){centerTab=t;document.querySelectorAll('#centerTabs .tab').forEa
 function rTab(t){rightTab=t;document.querySelectorAll('.panel:last-child .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tUsers').style.display=t==='users'?'flex':'none';$('tStats').style.display=t==='stats'?'flex':'none';$('tAccounts').style.display=t==='accounts'?'flex':'none';$('tKnowledge').style.display=t==='knowledge'?'flex':'none';if(t==='accounts')loadAccounts();if(t==='knowledge')loadKnowledge()}
 function lTab(t){leftTab=t;document.querySelectorAll('#leftTabs .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tFeed').style.display=t==='feed'?'flex':'none';$('tUserChats').style.display=t==='userchats'?'flex':'none';if(t==='userchats')loadUserChatSessions()}
 
+// ---- Chat file upload ----
+let chatFileData=null; // {filename, content}
+function onChatFileSelected(input){
+  if(!input.files?.length)return;
+  const file=input.files[0];
+  const fd=new FormData();fd.append('file',file);
+  $('chatFileName').textContent='Lade: '+file.name+'...';
+  $('chatFilePreview').style.display='flex';
+  fetch('/api/chat/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+    if(d.ok){chatFileData={filename:d.filename,content:d.content};$('chatFileName').textContent='📎 '+d.filename+(d.truncated?' (gekürzt)':'');$('chatFilePreview').style.display='flex'}
+    else{clearChatFile();alert('Fehler: '+(d.error||'Upload fehlgeschlagen'))}
+  }).catch(e=>{clearChatFile();alert('Upload Fehler: '+e.message)});
+}
+function clearChatFile(){chatFileData=null;$('chatFileInput').value='';$('chatFilePreview').style.display='none';$('chatFileName').textContent=''}
+
 // ---- Chat ----
 async function sendChat(){
   if(sending)return;const inp=$('chatInput'),q=inp.value.trim();if(!q)return;
   const model=$('modelSel').value;
   const uid=currentUser?.role==='admin'?($('chatUid').value||currentUser.username):currentUser.username;
-  chatHistory.push({role:'user',content:q});renderChatMsgs();inp.value='';inp.style.height='auto';
+  const displayMsg=chatFileData?'📎 '+chatFileData.filename+'\n'+q:q;
+  chatHistory.push({role:'user',content:displayMsg});renderChatMsgs();inp.value='';inp.style.height='auto';
   sending=true;$('chatSendBtn').disabled=true;
   const th=document.createElement('div');th.className='cthink';th.id='thinkInd';th.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';$('chatMessages').appendChild(th);scrollChat();
   try{
     const body={question:q,model};
+    if(chatFileData){body.file_context=chatFileData.content;body.file_name=chatFileData.filename}
     if(currentUser?.role==='admin')body.user_id=uid;
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();$('thinkInd')?.remove();
     if(d.ok)chatHistory.push({role:'bot',content:d.answer,model:d.model,ms:d.duration_ms});
     else chatHistory.push({role:'error',content:d.error||'Unknown error'});
   }catch(err){$('thinkInd')?.remove();chatHistory.push({role:'error',content:err.message})}
+  clearChatFile();
   sending=false;$('chatSendBtn').disabled=false;renderChatMsgs();$('chatInput').focus();
 }
 function renderChatMsgs(){

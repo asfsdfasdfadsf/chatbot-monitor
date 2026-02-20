@@ -44,6 +44,12 @@ except ImportError:
     HAS_NUMPY = False
 
 try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+try:
     import tiktoken
     HAS_TIKTOKEN = True
 except ImportError:
@@ -1285,6 +1291,85 @@ def embed_text(text: str) -> list:
     raise ValueError(f"Unknown embedding provider: {provider}")
 
 
+def parse_excel(file_bytes: bytes) -> str:
+    """Parse an Excel (.xlsx) file and return its content as text.
+
+    Each sheet becomes a section with a header row repeated for context.
+    Format: 'Header1 | Header2 | ...' on the first row, then data rows.
+    """
+    if not HAS_OPENPYXL:
+        raise ImportError("openpyxl is not installed. Run: pip install openpyxl")
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    parts = []
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        all_rows = []
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) if c is not None else "" for c in row]
+            if any(cells):
+                all_rows.append(cells)
+        if all_rows:
+            header = all_rows[0]
+            header_line = " | ".join(header)
+            lines = [f"## {sheet_name}", f"Spalten: {header_line}"]
+            for row_cells in all_rows[1:]:
+                # Format as "Header1: Value1, Header2: Value2, ..."
+                pairs = []
+                for h, v in zip(header, row_cells):
+                    if v.strip():
+                        pairs.append(f"{h}: {v}")
+                if pairs:
+                    lines.append(", ".join(pairs))
+            parts.append("\n".join(lines))
+    wb.close()
+    return "\n\n".join(parts)
+
+
+def chunk_tabular_text(text: str, chunk_size: int = 500) -> list:
+    """Chunk tabular text (from Excel) keeping section headers with each chunk."""
+    sections = re.split(r"(?=^## )", text, flags=re.MULTILINE)
+    chunks = []
+
+    def _count_tokens(t):
+        if HAS_TIKTOKEN:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+                return len(enc.encode(t))
+            except Exception:
+                pass
+        return len(t) // 4
+
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        lines = section.split("\n")
+        # First two lines are "## SheetName" and "Spalten: ..." — keep as header
+        header_lines = []
+        data_lines = []
+        for i, line in enumerate(lines):
+            if i < 2 or line.startswith("## ") or line.startswith("Spalten:"):
+                header_lines.append(line)
+            else:
+                data_lines.append(line)
+        header = "\n".join(header_lines)
+
+        current_chunk_lines = []
+        current_tokens = _count_tokens(header)
+        for dline in data_lines:
+            line_tokens = _count_tokens(dline)
+            if current_tokens + line_tokens > chunk_size and current_chunk_lines:
+                chunks.append(header + "\n" + "\n".join(current_chunk_lines))
+                current_chunk_lines = []
+                current_tokens = _count_tokens(header)
+            current_chunk_lines.append(dline)
+            current_tokens += line_tokens
+        if current_chunk_lines:
+            chunks.append(header + "\n" + "\n".join(current_chunk_lines))
+
+    return chunks if chunks else [text]
+
+
 def chunk_text(text: str, chunk_size: int = 500) -> list:
     """Split text into chunks by paragraphs, respecting token limits."""
     paragraphs = re.split(r"\n\s*\n", text)
@@ -1338,7 +1423,12 @@ def store_document(filename: str, content: str, username: str) -> dict:
         cs = config.get("rag_chunk_size", 500)
 
     doc_id = str(uuid.uuid4())
-    chunks = chunk_text(content, cs)
+    # Use tabular chunker for Excel files (keeps headers with every chunk)
+    is_tabular = filename.lower().endswith((".xlsx", ".xls")) or content.lstrip().startswith("## ") and "Spalten:" in content[:500]
+    if is_tabular:
+        chunks = chunk_tabular_text(content, cs)
+    else:
+        chunks = chunk_text(content, cs)
 
     conn = _get_embedding_conn()
     try:
@@ -1744,6 +1834,11 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self._handle_chat(session)
+        if path == "/api/chat/upload":
+            session = self._require_auth("user")
+            if not session:
+                return
+            return self._handle_chat_file_upload(session)
         if path == "/api/chat/clear":
             session = self._require_auth("user")
             if not session:
@@ -1955,6 +2050,75 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": f"OpenRouter exchange failed: {e}"}, 502)
 
+    def _handle_chat_file_upload(self, session: dict):
+        """POST /api/chat/upload — Upload a file and return parsed text for chat context."""
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype:
+            self._send_json({"error": "Content-Type must be multipart/form-data"}, 400)
+            return
+
+        try:
+            boundary = None
+            for part in ctype.split(";"):
+                part = part.strip()
+                if part.startswith("boundary="):
+                    boundary = part[9:].strip('"')
+                    break
+            if not boundary:
+                self._send_json({"error": "No boundary"}, 400)
+                return
+
+            body = self._read_body()
+            parts = body.split(("--" + boundary).encode())
+            filename = ""
+            file_bytes = b""
+            for part in parts:
+                if b"Content-Disposition" not in part:
+                    continue
+                header_end = part.find(b"\r\n\r\n")
+                if header_end == -1:
+                    continue
+                headers_raw = part[:header_end].decode("utf-8", errors="replace")
+                body_raw = part[header_end + 4:]
+                if body_raw.endswith(b"\r\n"):
+                    body_raw = body_raw[:-2]
+                fn_match = re.search(r'filename="([^"]*)"', headers_raw)
+                if fn_match and fn_match.group(1):
+                    filename = fn_match.group(1)
+                    file_bytes = body_raw
+
+            if not file_bytes:
+                self._send_json({"error": "No file content"}, 400)
+                return
+            if not filename:
+                filename = "upload.txt"
+
+            # Parse file content
+            if filename.lower().endswith((".xlsx", ".xls")):
+                if not HAS_OPENPYXL:
+                    self._send_json({"error": "Excel not supported (openpyxl missing)"}, 400)
+                    return
+                text = parse_excel(file_bytes)
+            else:
+                text = file_bytes.decode("utf-8", errors="replace")
+
+            # Truncate if too large (max ~8000 tokens ≈ 32000 chars)
+            max_chars = 32000
+            truncated = False
+            if len(text) > max_chars:
+                text = text[:max_chars]
+                truncated = True
+
+            self._send_json({
+                "ok": True,
+                "filename": filename,
+                "content": text,
+                "char_count": len(text),
+                "truncated": truncated,
+            })
+        except Exception as e:
+            self._send_json({"error": f"File parse failed: {e}"}, 500)
+
     def _handle_chat_clear(self, session: dict):
         """Clear chat history for the current session."""
         _, sid = self._get_session()
@@ -2139,9 +2303,16 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return
 
         question = data.get("question", "").strip()
+        file_context = data.get("file_context", "").strip()
+        file_name = data.get("file_name", "").strip()
         if not question:
             self._send_json({"error": "question is required"}, 400)
             return
+
+        # If file content is attached, prepend it to the question
+        if file_context:
+            file_label = f"[Datei: {file_name}]" if file_name else "[Hochgeladene Datei]"
+            question = f"{file_label}\n{file_context}\n\n{question}"
 
         # Admin can override user_id; regular users use their session username
         if session["role"] == "admin" and data.get("user_id"):
@@ -2176,8 +2347,11 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
         # Build system prompt with optional DB schema and RAG context
         system_parts = []
+        # Default to German if no custom system prompt is set
         if system_prompt:
             system_parts.append(system_prompt)
+        else:
+            system_parts.append("Antworte immer auf Deutsch, es sei denn der Benutzer schreibt in einer anderen Sprache.")
 
         # RAG: inject relevant knowledge base chunks
         rag_chunks = []
@@ -2980,7 +3154,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             # Parse multipart manually (avoid cgi.FieldStorage deprecation)
             parts = body.split(("--" + boundary).encode())
             filename = ""
-            file_content = ""
+            file_bytes = b""
             for part in parts:
                 if b"Content-Disposition" not in part:
                     continue
@@ -3000,15 +3174,24 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
                 if fn_match and fn_match.group(1):
                     filename = fn_match.group(1)
-                    file_content = body_raw.decode("utf-8", errors="replace")
+                    file_bytes = body_raw
                 elif name_match and name_match.group(1) == "filename":
                     filename = body_raw.decode("utf-8", errors="replace").strip()
 
-            if not file_content:
+            if not file_bytes:
                 self._send_json({"error": "No file content found"}, 400)
                 return
             if not filename:
                 filename = "upload.txt"
+
+            # Handle Excel files
+            if filename.lower().endswith((".xlsx", ".xls")):
+                if not HAS_OPENPYXL:
+                    self._send_json({"error": "Excel support requires openpyxl. Run: pip install openpyxl"}, 400)
+                    return
+                file_content = parse_excel(file_bytes)
+            else:
+                file_content = file_bytes.decode("utf-8", errors="replace")
 
             result = store_document(filename, file_content, session["username"])
             self._send_json({"ok": True, **result})
