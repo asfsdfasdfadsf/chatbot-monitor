@@ -315,8 +315,8 @@ _pkce_lock = threading.Lock()
 
 
 def _pkce_code_verifier() -> str:
-    """Generate a PKCE code verifier (32 bytes, base64url-encoded, matching Codex CLI)."""
-    return secrets.token_urlsafe(32)
+    """Generate a PKCE code verifier (64 bytes, base64url-encoded, matching Codex CLI)."""
+    return secrets.token_urlsafe(64)
 
 
 def _pkce_code_challenge(verifier: str) -> str:
@@ -416,15 +416,15 @@ def refresh_openai_token() -> str | None:
         return None
 
     try:
-        body = urlencode({
+        body = json.dumps({
             "grant_type": "refresh_token",
             "client_id": OPENAI_CLIENT_ID,
             "refresh_token": refresh_tok,
-            "scope": "openid profile email offline_access",
+            "scope": "openid profile email",
         }).encode("utf-8")
         req = Request(
             OPENAI_TOKEN_URL, data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         resp = urlopen(req, timeout=10)
@@ -441,9 +441,9 @@ def refresh_openai_token() -> str | None:
                 exchange_body = urlencode({
                     "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                     "client_id": OPENAI_CLIENT_ID,
+                    "requested_token": "openai-api-key",
                     "subject_token": id_token,
                     "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-                    "audience": "https://api.openai.com/v1",
                 }).encode("utf-8")
                 req2 = Request(
                     OPENAI_TOKEN_URL, data=exchange_body,
@@ -731,12 +731,15 @@ def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[s
     return answer, round(duration_ms, 1)
 
 
+CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api/codex"
+
+
 def _using_oauth_token() -> bool:
     """Check if we're using a raw OAuth token (no API key from token exchange)."""
     with config_lock:
         has_api_key = bool(config.get("openai_api_key"))
         has_oauth = bool(config.get("openai_oauth_token"))
-    # Only use Responses API if we have OAuth but no proper API key
+    # Use ChatGPT backend if we have OAuth but no proper API key
     return has_oauth and not has_api_key
 
 
@@ -772,7 +775,7 @@ def _call_openai_chat_completions(base_url: str, bearer: str, messages: list[dic
 
 
 def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float) -> str:
-    """Call OpenAI Responses API (for OAuth tokens)."""
+    """Call OpenAI Responses API (works with both api.openai.com and chatgpt.com backend)."""
     if not model:
         model = "gpt-4o-mini"
     system_text = ""
@@ -791,15 +794,13 @@ def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], mod
         body["temperature"] = temperature
 
     data = json.dumps(body).encode("utf-8")
-    print(f"[openai] Responses API request: model={model}, input_parts={len(input_parts)}", file=sys.stderr)
-    req = Request(
-        f"{base_url}/responses", data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {bearer}",
-        },
-        method="POST",
-    )
+    url = f"{base_url}/responses"
+    print(f"[openai] Responses API request: url={url}, model={model}, input_parts={len(input_parts)}", file=sys.stderr)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {bearer}",
+    }
+    req = Request(url, data=data, headers=headers, method="POST")
     try:
         resp = urlopen(req, timeout=120)
     except Exception as e:
@@ -835,20 +836,18 @@ def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[s
     start = time.time()
 
     if use_oauth:
-        # OAuth token: try Chat Completions first (more reliable with OAuth), then Responses API
+        # OAuth token (ChatGPT login): must use chatgpt.com backend, NOT api.openai.com
+        # The raw OAuth access_token is only valid for the ChatGPT backend API
+        print(f"[openai] Using ChatGPT backend (OAuth token)", file=sys.stderr)
         try:
-            answer = _call_openai_chat_completions(base_url, bearer, messages, model, temperature)
+            answer = _call_openai_responses(CHATGPT_BACKEND_URL, bearer, messages, model, temperature)
         except Exception as e1:
-            print(f"[openai] Chat Completions API failed: {e1}", file=sys.stderr)
-            # If 429 rate limit, don't bother trying the other API
+            print(f"[openai] ChatGPT backend failed: {e1}", file=sys.stderr)
             if "429" in str(e1):
                 raise ValueError("OpenAI rate limit reached — your account usage limit may be exceeded. Please wait or check your OpenAI plan.")
-            try:
-                answer = _call_openai_responses(base_url, bearer, messages, model, temperature)
-            except Exception as e2:
-                print(f"[openai] Responses API also failed: {e2}", file=sys.stderr)
-                raise ValueError(f"OpenAI API call failed. Error: {e1}")
+            raise ValueError(f"OpenAI API call failed. Error: {e1}")
     else:
+        # API key: use standard api.openai.com with Chat Completions
         answer = _call_openai_chat_completions(base_url, bearer, messages, model, temperature)
 
     duration_ms = (time.time() - start) * 1000
@@ -973,13 +972,19 @@ def list_models() -> list[dict]:
 
     if provider == "openai":
         bearer = get_openai_bearer_token()
-        with config_lock:
-            base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
         if not bearer:
             return OPENAI_MODELS  # fallback list
+        use_oauth = _using_oauth_token()
+        if use_oauth:
+            # OAuth: fetch models from ChatGPT backend
+            models_url = f"{CHATGPT_BACKEND_URL}/models"
+        else:
+            with config_lock:
+                base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+            models_url = f"{base_url}/models"
         try:
             req = Request(
-                f"{base_url}/models", method="GET",
+                models_url, method="GET",
                 headers={"Authorization": f"Bearer {bearer}"},
             )
             resp = urlopen(req, timeout=5)
@@ -2155,7 +2160,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             "code_challenge": challenge,
             "code_challenge_method": "S256",
             "state": state,
-            "audience": "https://api.openai.com/v1",
             "codex_cli_simplified_flow": "true",
             "id_token_add_organizations": "true",
         })
@@ -2225,9 +2229,9 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     exchange_body = urlencode({
                         "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                         "client_id": OPENAI_CLIENT_ID,
+                        "requested_token": "openai-api-key",
                         "subject_token": id_token,
                         "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-                        "audience": "https://api.openai.com/v1",
                     }).encode("utf-8")
                     req2 = Request(
                         OPENAI_TOKEN_URL, data=exchange_body,
@@ -2240,7 +2244,6 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     print(f"[oauth] Token exchange succeeded, got API key: {bool(api_key)}", file=sys.stderr)
                 except Exception as exc:
                     print(f"[oauth] Token exchange for API key failed: {exc}", file=sys.stderr)
-                    # Try reading the error body for more details
                     if hasattr(exc, 'read'):
                         try:
                             err_body = exc.read().decode()
