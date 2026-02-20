@@ -161,7 +161,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 /* Settings modal */
 .modal { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.5); z-index:100; align-items:center; justify-content:center; }
 .modal.open { display:flex; }
-.mbox { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px; width:420px; max-width:90vw; }
+.mbox { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px; width:460px; max-width:90vw; max-height:85vh; overflow-y:auto; }
 .mbox h2 { font-size:15px; margin-bottom:14px; }
 .mf { margin-bottom:12px; }
 .mf label { display:block; font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.3px; margin-bottom:4px; }
@@ -193,6 +193,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .login-error { color:var(--red); font-size:12px; text-align:center; margin-top:8px; min-height:18px; }
 .role-badge { font-size:10px; font-weight:600; padding:1px 6px; border-radius:6px; text-transform:uppercase; }
 .role-badge.admin { background:rgba(248,81,73,0.15); color:var(--red); }
+.role-badge.mitarbeiter { background:rgba(57,210,192,0.15); color:var(--cyan); }
 .role-badge.user { background:rgba(88,166,255,0.15); color:var(--accent); }
 .user-header-info { display:flex; align-items:center; gap:6px; margin-left:8px; }
 </style>
@@ -237,17 +238,25 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
   </div>
 
   <div class="panels">
-    <!-- LEFT: Feed -->
+    <!-- LEFT: Feed / User Chats -->
     <div class="panel">
-      <div class="panel-hdr">Live Feed <span id="feedCount" style="margin-left:auto;color:var(--accent)">0</span></div>
-      <div class="ffilters" id="feedFilters">
-        <button class="fbtn on" data-f="all">All</button>
-        <button class="fbtn" data-f="chat">Chat</button>
-        <button class="fbtn" data-f="query">SQL</button>
-        <button class="fbtn" data-f="error">Errors</button>
-        <button class="fbtn" data-f="flagged">Flagged</button>
+      <div class="tabs" id="leftTabs">
+        <button class="tab active" data-t="feed" onclick="lTab('feed')">Live Feed <span id="feedCount" style="font-size:10px;color:var(--accent);margin-left:2px">0</span></button>
+        <button class="tab admin-only" data-t="userchats" onclick="lTab('userchats')">User Chats <span class="tbadge hide" id="ucBadge">0</span></button>
       </div>
-      <div class="panel-body" id="feedBody"></div>
+      <div id="tFeed" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
+        <div class="ffilters" id="feedFilters">
+          <button class="fbtn on" data-f="all">All</button>
+          <button class="fbtn" data-f="chat">Chat</button>
+          <button class="fbtn" data-f="query">SQL</button>
+          <button class="fbtn" data-f="error">Errors</button>
+          <button class="fbtn" data-f="flagged">Flagged</button>
+        </div>
+        <div class="panel-body" id="feedBody"></div>
+      </div>
+      <div id="tUserChats" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+        <div class="panel-body" id="userChatsBody"><div class="dempty">No active chat sessions</div></div>
+      </div>
     </div>
 
     <!-- CENTER: Chat / Detail / SQL -->
@@ -255,7 +264,8 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       <div class="tabs" id="centerTabs">
         <button class="tab active" data-t="chat" onclick="cTab('chat')">Chat</button>
         <button class="tab" data-t="detail" onclick="cTab('detail')">Detail</button>
-        <button class="tab admin-only" data-t="sql" onclick="cTab('sql')">SQL <span class="tbadge hide" id="sqlBadge">0</span></button>
+        <button class="tab staff-only" data-t="sql" onclick="cTab('sql')">SQL <span class="tbadge hide" id="sqlBadge">0</span></button>
+        <button class="tab admin-only" data-t="adminchat" onclick="cTab('adminchat')" id="adminChatTab" style="display:none">View Chat</button>
       </div>
       <div id="tChat" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
         <div class="cmsg" id="chatMessages"><div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Messages go to your local Ollama</div></div></div>
@@ -281,7 +291,26 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
         </div>
       </div>
       <div id="tSql" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+        <div id="sqlRunBar" class="admin-only" style="padding:8px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;display:none">
+          <div style="display:flex;gap:4px">
+            <input id="sqlRunInput" placeholder="SELECT * FROM ..." style="flex:1;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;font-family:'Cascadia Code','Fira Code',Consolas,monospace;outline:none" onkeydown="if(event.key==='Enter')runSqlQuery()">
+            <button class="mbtn" onclick="runSqlQuery()" style="font-size:11px;white-space:nowrap">Run Query</button>
+          </div>
+          <div id="sqlRunResult" style="margin-top:6px;max-height:300px;overflow:auto"></div>
+        </div>
         <div class="panel-body" id="sqlBody"><div class="dempty">SQL queries will appear here</div></div>
+      </div>
+      <div id="tAdminChat" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+        <div id="adminChatHeader" style="padding:10px 12px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="badge buser" id="acUser">—</span>
+            <span class="badge bmod" id="acModel">—</span>
+            <span style="font-size:11px;color:var(--text-dim)" id="acMsgCount">0 messages</span>
+            <span style="font-size:11px;color:var(--text-dim)" id="acStarted">—</span>
+            <span style="font-size:10px;color:var(--green);margin-left:auto" id="acLive">LIVE</span>
+          </div>
+        </div>
+        <div class="cmsg" id="adminChatMessages"><div class="dempty">Select a session from User Chats</div></div>
       </div>
     </div>
 
@@ -291,6 +320,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
         <button class="tab active admin-only" data-t="users" onclick="rTab('users')">Users <span class="tbadge hide" id="usersBadge">0</span></button>
         <button class="tab" data-t="stats" onclick="rTab('stats')">Stats</button>
         <button class="tab admin-only" data-t="accounts" onclick="rTab('accounts')">Accounts</button>
+        <button class="tab staff-only" data-t="knowledge" onclick="rTab('knowledge')">Knowledge</button>
       </div>
       <div id="tUsers" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
         <div class="panel-body" id="usersBody"><div class="dempty">No users yet</div></div>
@@ -300,6 +330,36 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       </div>
       <div id="tAccounts" style="display:none;flex-direction:column;flex:1;overflow:hidden">
         <div class="panel-body" id="accountsBody"><div class="dempty">Loading accounts...</div></div>
+      </div>
+      <div id="tKnowledge" style="display:none;flex-direction:column;flex:1;overflow:hidden">
+        <div class="panel-body" id="knowledgeBody">
+          <div class="sc admin-only" style="padding:10px">
+            <div class="sl">Upload Document</div>
+            <div style="margin-top:8px">
+              <input type="file" id="kbFileInput" accept=".txt,.md,.csv,.json,.log" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;display:block;width:100%">
+              <button class="mbtn" onclick="uploadKbFile()" style="font-size:11px;width:100%;margin-top:4px">Upload File</button>
+            </div>
+            <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
+              <input id="kbTextTitle" placeholder="Title..." style="width:100%;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:11px;margin-bottom:4px;box-sizing:border-box">
+              <textarea id="kbTextContent" rows="3" placeholder="Paste text here..." style="width:100%;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:11px;resize:vertical;font-family:inherit;box-sizing:border-box"></textarea>
+              <button class="mbtn" onclick="uploadKbText()" style="font-size:11px;width:100%;margin-top:4px">Add Text</button>
+            </div>
+            <div id="kbUploadStatus" style="font-size:11px;margin-top:6px;min-height:16px"></div>
+          </div>
+
+          <div class="stitle">Documents</div>
+          <div id="kbDocList"><div style="color:var(--text-dim);font-size:11px">No documents uploaded</div></div>
+
+          <div class="stitle">Stats</div>
+          <div id="kbStats" class="sc" style="padding:8px"><span style="color:var(--text-dim);font-size:11px">Loading...</span></div>
+
+          <div class="stitle">Search Test</div>
+          <div style="display:flex;gap:4px;margin-bottom:6px">
+            <input id="kbSearchInput" placeholder="Test query..." style="flex:1;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:11px" onkeydown="if(event.key==='Enter')searchKb()">
+            <button class="mbtn" onclick="searchKb()" style="font-size:11px">Search</button>
+          </div>
+          <div id="kbSearchResults"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -342,17 +402,65 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
     <div class="mf"><label>Default Model</label><select id="cfgModel"><option>loading...</option></select></div>
     <div class="mf"><label>System Prompt</label><textarea id="cfgPrompt" placeholder="e.g. Du bist ein WaWi-Assistent."></textarea></div>
     <div class="mf"><label>Temperature</label><input id="cfgTemp" type="number" min="0" max="2" step="0.1" value="0.7"></div>
+
+    <div style="border-top:1px solid var(--border);margin:14px 0 10px;padding-top:10px">
+      <div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Database Connection</div>
+    </div>
+    <div class="mf" style="display:flex;align-items:center;gap:8px">
+      <label style="display:inline;margin:0">Enable Database</label>
+      <input type="checkbox" id="cfgDbEnabled">
+    </div>
+    <div class="mf"><label>Database Type</label>
+      <select id="cfgDbType" onchange="onDbTypeChange()">
+        <option value="">None</option>
+        <option value="mssql">MSSQL</option>
+        <option value="sqlite">SQLite</option>
+      </select>
+    </div>
+    <div id="cfgDbMssqlRows" style="display:none">
+      <div class="mf"><label>Server</label><input id="cfgDbMssqlServer" placeholder="localhost\JTLWAWI"></div>
+      <div class="mf"><label>Database</label><input id="cfgDbMssqlDatabase" placeholder="eazybusiness"></div>
+      <div class="mf"><label>Username</label><input id="cfgDbMssqlUser" placeholder="sa"></div>
+      <div class="mf"><label>Password</label><input id="cfgDbMssqlPassword" type="password" placeholder="****"></div>
+      <div class="mf"><label>ODBC Driver</label><input id="cfgDbMssqlDriver" placeholder="ODBC Driver 17 for SQL Server"></div>
+    </div>
+    <div id="cfgDbSqliteRows" style="display:none">
+      <div class="mf"><label>File Path</label><input id="cfgDbSqlitePath" placeholder="./data/mydb.db"></div>
+    </div>
+    <div class="mf">
+      <button class="mbtn" onclick="testDbConnection()" id="btnTestDb" style="font-size:12px;padding:6px 14px">Test Connection</button>
+      <span id="dbTestResult" style="font-size:11px;margin-left:8px"></span>
+    </div>
+
+    <div style="border-top:1px solid var(--border);margin:14px 0 10px;padding-top:10px">
+      <div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Knowledge Base (RAG)</div>
+    </div>
+    <div class="mf" style="display:flex;align-items:center;gap:8px">
+      <label style="display:inline;margin:0">Enable RAG</label>
+      <input type="checkbox" id="cfgRagEnabled">
+    </div>
+    <div class="mf"><label>Embedding Provider</label>
+      <select id="cfgEmbeddingProvider">
+        <option value="auto">Auto (OpenAI if key, else Ollama)</option>
+        <option value="openai">OpenAI</option>
+        <option value="ollama">Ollama</option>
+      </select>
+    </div>
+    <div class="mf"><label>Embedding Model</label><input id="cfgEmbeddingModel" placeholder="text-embedding-3-small or nomic-embed-text"></div>
+    <div class="mf"><label>Top-K Results</label><input id="cfgRagTopK" type="number" min="1" max="20" value="5"></div>
+
     <div class="mactions"><button onclick="closeSettings()">Cancel</button><button class="primary" onclick="saveSettings()">Save</button></div>
   </div>
 </div>
 
 <script>
 let events=[],moderation={},usersMap={},selectedId=null,selectedUser=null;
-let activeFilter='all',centerTab='chat',rightTab='users';
+let activeFilter='all',centerTab='chat',rightTab='users',leftTab='feed';
 let connected=false,sending=false,chatHistory=[],ollamaModels=[],appCfg={};
 let currentUser=null; // {username, role}
 let authMode='login';
 let statsInterval=null;
+let adminChatSessions=[],viewingSessionId=null,ucRefreshTimer=null;
 
 // ---- Auth Flow ----
 async function checkAuth(){
@@ -383,13 +491,19 @@ function showDashboard(){
   }
 }
 function applyRole(role){
+  // admin-only: settings, clear all, accounts, user management, moderation, raw SQL
   document.querySelectorAll('.admin-only').forEach(el=>{
     el.style.display=role==='admin'?'':'none';
+  });
+  // mitarbeiter-only: Knowledge tab (view-only), SQL query log
+  document.querySelectorAll('.staff-only').forEach(el=>{
+    el.style.display=(role==='admin'||role==='mitarbeiter')?'':'none';
   });
   // For non-admin: hide moderation bar, switch to stats tab on right
   if(role!=='admin'){
     $('modBar').style.display='none';
-    rTab('stats');
+    if(role==='mitarbeiter') rTab('stats');
+    else rTab('stats');
   }
 }
 function loginTab(mode){
@@ -419,6 +533,8 @@ async function doLogout(){
   try{await fetch('/api/auth/logout',{method:'POST'})}catch(e){}
   currentUser=null;events=[];moderation={};usersMap={};
   if(statsInterval){clearInterval(statsInterval);statsInterval=null}
+  if(ucRefreshTimer){clearInterval(ucRefreshTimer);ucRefreshTimer=null}
+  viewingSessionId=null;adminChatSessions=[];
   showLogin();
 }
 
@@ -444,13 +560,14 @@ function connectSSE(){
       if(evt.type==='chat')usersMap[evt.user_id].message_count=(usersMap[evt.user_id].message_count||0)+1;
       renderUsers();
     }
-    if(currentUser?.role==='admin')refreshStats();
+    if(currentUser?.role==='admin'){refreshStats();if(evt.type==='chat'&&leftTab==='userchats')loadUserChatSessions();if(evt.type==='chat'&&viewingSessionId)refreshAdminChat()}
   };
 }
 
 // ---- Tabs ----
-function cTab(t){centerTab=t;document.querySelectorAll('#centerTabs .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tChat').style.display=t==='chat'?'flex':'none';$('tDetail').style.display=t==='detail'?'flex':'none';$('tSql').style.display=t==='sql'?'flex':'none';if(t==='chat')$('chatInput').focus()}
-function rTab(t){rightTab=t;document.querySelectorAll('.panel:last-child .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tUsers').style.display=t==='users'?'flex':'none';$('tStats').style.display=t==='stats'?'flex':'none';$('tAccounts').style.display=t==='accounts'?'flex':'none';if(t==='accounts')loadAccounts()}
+function cTab(t){centerTab=t;document.querySelectorAll('#centerTabs .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tChat').style.display=t==='chat'?'flex':'none';$('tDetail').style.display=t==='detail'?'flex':'none';$('tSql').style.display=t==='sql'?'flex':'none';$('tAdminChat').style.display=t==='adminchat'?'flex':'none';if(t==='chat')$('chatInput').focus();if(t==='sql'&&currentUser?.role==='admin'&&appCfg.db_enabled)$('sqlRunBar').style.display='block';else $('sqlRunBar').style.display='none'}
+function rTab(t){rightTab=t;document.querySelectorAll('.panel:last-child .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tUsers').style.display=t==='users'?'flex':'none';$('tStats').style.display=t==='stats'?'flex':'none';$('tAccounts').style.display=t==='accounts'?'flex':'none';$('tKnowledge').style.display=t==='knowledge'?'flex':'none';if(t==='accounts')loadAccounts();if(t==='knowledge')loadKnowledge()}
+function lTab(t){leftTab=t;document.querySelectorAll('#leftTabs .tab').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('tFeed').style.display=t==='feed'?'flex':'none';$('tUserChats').style.display=t==='userchats'?'flex':'none';if(t==='userchats')loadUserChatSessions()}
 
 // ---- Chat ----
 async function sendChat(){
@@ -634,6 +751,7 @@ function renderAccounts(accts){
         <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
           <select style="padding:2px 6px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:10px" onchange="setAccountRole('${esc(a.username)}',this.value)">
             <option value="admin"${a.role==='admin'?' selected':''}>admin</option>
+            <option value="mitarbeiter"${a.role==='mitarbeiter'?' selected':''}>mitarbeiter</option>
             <option value="user"${a.role==='user'?' selected':''}>user</option>
           </select>
           <select style="padding:2px 6px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:10px" onchange="setAccountPriority('${esc(a.username)}',this.value)">
@@ -799,6 +917,71 @@ async function newChat(){
   renderChatMsgs();
   $('chatInput').focus();
 }
+
+// ---- Admin Chat Viewer ----
+async function loadUserChatSessions(){
+  if(currentUser?.role!=='admin')return;
+  try{
+    const r=await fetch('/api/admin/chats');if(!r.ok)return;
+    const d=await r.json();adminChatSessions=d.sessions||[];
+    renderUserChatSessions();
+  }catch(e){}
+}
+function renderUserChatSessions(){
+  const body=$('userChatsBody');
+  const badge=$('ucBadge');
+  if(adminChatSessions.length>0){badge.textContent=adminChatSessions.length;badge.classList.remove('hide')}else{badge.classList.add('hide')}
+  if(!adminChatSessions.length){body.innerHTML='<div class="dempty">No active chat sessions</div>';return}
+  body.innerHTML=adminChatSessions.map(s=>{
+    const lastAgo=s.last_activity?timeAgo(s.last_activity):'—';
+    const isViewing=viewingSessionId===s.session_id;
+    return`<div class="fi${isViewing?' sel':''}" onclick="viewAdminChat('${esc(s.session_id)}')">
+      <div class="ft chat" style="display:flex;align-items:center;gap:6px">
+        <span>${esc(s.username||'anonymous')}</span>
+        <span style="font-size:9px;font-weight:400;color:var(--text-dim)">${s.message_count} msgs</span>
+      </div>
+      <div class="fp">${esc(s.model||'—')}</div>
+      <div class="fm"><span>${lastAgo}</span></div>
+    </div>`;
+  }).join('');
+}
+async function viewAdminChat(sessionId){
+  viewingSessionId=sessionId;
+  renderUserChatSessions();
+  // Show the admin chat tab in center
+  $('adminChatTab').style.display='';
+  cTab('adminchat');
+  await refreshAdminChat();
+  // Start auto-refresh
+  if(ucRefreshTimer)clearInterval(ucRefreshTimer);
+  ucRefreshTimer=setInterval(refreshAdminChat,2000);
+}
+async function refreshAdminChat(){
+  if(!viewingSessionId)return;
+  try{
+    const r=await fetch('/api/admin/chats/'+viewingSessionId);
+    if(!r.ok){$('adminChatMessages').innerHTML='<div class="dempty">Session not found or expired</div>';return}
+    const d=await r.json();
+    const meta=d.meta||{};
+    $('acUser').textContent=meta.username||'anonymous';
+    $('acModel').textContent=meta.model||'—';
+    $('acMsgCount').textContent=(d.messages||[]).length+' messages';
+    $('acStarted').textContent=meta.created_at?'Started: '+fmtTime(meta.created_at):'';
+    renderAdminChatMessages(d.messages||[]);
+  }catch(e){}
+}
+function renderAdminChatMessages(messages){
+  const c=$('adminChatMessages');
+  if(!messages.length){c.innerHTML='<div class="dempty">No messages yet</div>';return}
+  const wasAtBottom=c.scrollHeight-c.scrollTop-c.clientHeight<50;
+  c.innerHTML=messages.map(m=>{
+    const ts=m.timestamp?`<span style="font-size:10px;color:var(--text-dim)">${fmtTime(m.timestamp)}</span>`:'';
+    if(m.role==='user')return`<div class="bubble q"><div class="bl">User ${ts}</div>${esc(m.content)}</div>`;
+    return`<div class="bubble a"><div class="bl">Bot ${ts}</div>${esc(m.content)}</div>`;
+  }).join('');
+  if(wasAtBottom)c.scrollTop=c.scrollHeight;
+}
+let _loadedDbPassword='';
 async function loadCfg(){
   try{
     const r=await fetch('/api/config');if(!r.ok)return;
@@ -813,6 +996,22 @@ async function loadCfg(){
     $('cfgAnthropicKey').value=_loadedAnthropicKey;
     $('cfgPrompt').value=appCfg.system_prompt||'';
     $('cfgTemp').value=appCfg.temperature??0.7;
+    // DB settings
+    $('cfgDbEnabled').checked=!!appCfg.db_enabled;
+    $('cfgDbType').value=appCfg.db_type||'';
+    $('cfgDbMssqlServer').value=appCfg.db_mssql_server||'';
+    $('cfgDbMssqlDatabase').value=appCfg.db_mssql_database||'';
+    $('cfgDbMssqlUser').value=appCfg.db_mssql_user||'';
+    _loadedDbPassword=appCfg.db_mssql_password||'';
+    $('cfgDbMssqlPassword').value=_loadedDbPassword;
+    $('cfgDbMssqlDriver').value=appCfg.db_mssql_driver||'ODBC Driver 17 for SQL Server';
+    $('cfgDbSqlitePath').value=appCfg.db_sqlite_path||'';
+    onDbTypeChange();
+    // RAG settings
+    $('cfgRagEnabled').checked=!!appCfg.rag_enabled;
+    $('cfgEmbeddingProvider').value=appCfg.embedding_provider||'auto';
+    $('cfgEmbeddingModel').value=appCfg.embedding_model||'';
+    $('cfgRagTopK').value=appCfg.rag_top_k||5;
     onProviderChange();
     await loadModels();
     $('cfgModel').value=appCfg.default_model||'';
@@ -827,12 +1026,27 @@ async function saveSettings(){
     system_prompt:$('cfgPrompt').value,
     temperature:parseFloat($('cfgTemp').value)||0.7,
     openai_base_url:$('cfgOpenaiUrl').value,
+    // DB settings
+    db_enabled:$('cfgDbEnabled').checked,
+    db_type:$('cfgDbType').value,
+    db_mssql_server:$('cfgDbMssqlServer').value,
+    db_mssql_database:$('cfgDbMssqlDatabase').value,
+    db_mssql_user:$('cfgDbMssqlUser').value,
+    db_mssql_driver:$('cfgDbMssqlDriver').value,
+    db_sqlite_path:$('cfgDbSqlitePath').value,
+    // RAG settings
+    rag_enabled:$('cfgRagEnabled').checked,
+    embedding_provider:$('cfgEmbeddingProvider').value,
+    embedding_model:$('cfgEmbeddingModel').value,
+    rag_top_k:parseInt($('cfgRagTopK').value)||5,
   };
   // Only send API key if user changed it (not the masked value)
   const okey=$('cfgOpenaiKey').value;
   if(okey&&okey!==_loadedOpenaiKey)c.openai_api_key=okey;
   const akey=$('cfgAnthropicKey').value;
   if(akey&&akey!==_loadedAnthropicKey)c.anthropic_api_key=akey;
+  const dbpw=$('cfgDbMssqlPassword').value;
+  if(dbpw&&dbpw!==_loadedDbPassword)c.db_mssql_password=dbpw;
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
   const d=await r.json();
   if(d.config)appCfg=d.config;
@@ -852,6 +1066,197 @@ function fmtDur(ms){if(ms>=1000)return(ms/1000).toFixed(1)+'s';return Math.round
 function timeBadge(ms){if(!ms)return'btime';if(ms<100)return'bfast';if(ms<500)return'bmed';return'bslow'}
 function timeAgo(ts){const s=Math.floor(Date.now()/1000-ts);if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'}
 function hlSQL(sql){let r=esc(sql);r=r.replace(/('[^']*')/g,'<span class="ss">$1</span>');r=r.replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|IS|NULL|AS|ORDER BY|GROUP BY|HAVING|LIMIT|OFFSET|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|ALTER|DROP|TABLE|INDEX|COUNT|SUM|AVG|MIN|MAX|DISTINCT|BETWEEN|LIKE|UNION|ALL|EXISTS|CASE|WHEN|THEN|ELSE|END|WITH)\b/gi,'<span class="sk">$1</span>');r=r.replace(/\b(\d+\.?\d*)\b/g,'<span class="sn">$1</span>');return r}
+
+// ---- DB Settings UI ----
+function onDbTypeChange(){
+  const t=$('cfgDbType').value;
+  $('cfgDbMssqlRows').style.display=t==='mssql'?'block':'none';
+  $('cfgDbSqliteRows').style.display=t==='sqlite'?'block':'none';
+}
+async function testDbConnection(){
+  const st=$('dbTestResult');st.textContent='Testing...';st.style.color='var(--text-dim)';
+  // Save current settings first so the server has them
+  await saveSettings();
+  // Re-open settings since saveSettings closes the modal
+  openSettings();
+  try{
+    const r=await fetch('/api/db/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(d.ok){st.textContent='Connected! '+d.tables+' tables found.';st.style.color='var(--green)'}
+    else{st.textContent='Error: '+(d.error||'Unknown');st.style.color='var(--red)'}
+  }catch(e){st.textContent='Connection failed: '+e.message;st.style.color='var(--red)'}
+}
+
+// ---- SQL Run Query ----
+async function runSqlQuery(){
+  const sql=$('sqlRunInput').value.trim();if(!sql)return;
+  const res=$('sqlRunResult');res.innerHTML='<span style="color:var(--text-dim);font-size:11px">Executing...</span>';
+  try{
+    const r=await fetch('/api/db/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
+    const d=await r.json();
+    if(d.error){res.innerHTML='<div class="qerr">'+esc(d.error)+'</div>';return}
+    let h='<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">'+d.row_count+' rows, '+d.duration_ms+'ms</div>';
+    if(d.rows?.length>0)h+=rtbl(d.rows);else h+='<div style="color:var(--text-dim);font-size:11px">No rows returned</div>';
+    res.innerHTML=h;
+  }catch(e){res.innerHTML='<div class="qerr">'+esc(e.message)+'</div>'}
+}
+
+// ---- Knowledge Base ----
+async function loadKnowledge(){
+  await Promise.all([loadKbDocs(),loadKbStats()]);
+}
+let _kbViewingDoc=null; // currently expanded doc id
+async function loadKbDocs(){
+  try{
+    const r=await fetch('/api/embeddings/documents');if(!r.ok)return;
+    const d=await r.json();
+    const list=$('kbDocList');
+    if(!d.documents?.length){list.innerHTML='<div style="color:var(--text-dim);font-size:11px">No documents uploaded</div>';_kbViewingDoc=null;return}
+    const isAdmin=currentUser?.role==='admin';
+    list.innerHTML=d.documents.map(doc=>`
+      <div class="ucard" style="padding:8px 10px;margin-bottom:4px;cursor:pointer" onclick="viewKbDoc('${esc(doc.id)}')" id="kbdoc-${doc.id}">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-weight:600;font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(doc.filename)}</span>
+          <span style="font-size:10px;color:var(--text-dim);white-space:nowrap">${doc.chunk_count} chunks</span>
+          ${isAdmin?`<button class="mbtn" style="padding:2px 6px;font-size:10px;color:var(--accent)" onclick="event.stopPropagation();editKbDoc('${esc(doc.id)}')">Edit</button>
+          <button class="mbtn" style="padding:2px 6px;font-size:10px;color:var(--red)" onclick="event.stopPropagation();deleteKbDoc('${esc(doc.id)}')">Del</button>`:''}
+        </div>
+        <div style="font-size:10px;color:var(--text-dim)">${doc.uploaded_by||'?'} &middot; ${doc.uploaded_at?fmtTime(doc.uploaded_at):''}</div>
+      </div>
+      <div id="kbdetail-${doc.id}" style="display:none"></div>
+    `).join('');
+    // Re-expand if we were viewing one
+    if(_kbViewingDoc)viewKbDoc(_kbViewingDoc);
+  }catch(e){}
+}
+async function viewKbDoc(id){
+  const detail=$('kbdetail-'+id);
+  if(!detail)return;
+  // Toggle
+  if(_kbViewingDoc===id&&detail.style.display!=='none'){detail.style.display='none';_kbViewingDoc=null;return}
+  // Collapse any other
+  document.querySelectorAll('[id^="kbdetail-"]').forEach(el=>el.style.display='none');
+  _kbViewingDoc=id;
+  detail.style.display='block';
+  detail.innerHTML='<div style="padding:8px;color:var(--text-dim);font-size:11px">Loading...</div>';
+  try{
+    const r=await fetch('/api/embeddings/documents/'+id);if(!r.ok){detail.innerHTML='<div style="color:var(--red);font-size:11px;padding:8px">Error loading</div>';return}
+    const d=await r.json();const doc=d.document;
+    detail.innerHTML=`
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:0 0 8px 8px;margin-top:-4px;margin-bottom:6px;padding:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.3px;margin-bottom:6px">Content</div>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:12px;line-height:1.5;white-space:pre-wrap;max-height:200px;overflow-y:auto;color:var(--text)">${esc(doc.content)}</div>
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.3px;margin:10px 0 6px">Chunks (${doc.chunks.length})</div>
+        ${doc.chunks.map((ch,i)=>`
+          <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px">
+            <div style="display:flex;gap:6px;margin-bottom:2px">
+              <span style="font-size:10px;font-weight:600;color:var(--accent)">#${ch.chunk_index}</span>
+              <span style="font-size:10px;color:var(--text-dim)">${ch.token_count||'?'} tokens</span>
+            </div>
+            <div style="font-size:11px;line-height:1.4;color:var(--text);white-space:pre-wrap;max-height:100px;overflow-y:auto">${esc(ch.content)}</div>
+          </div>
+        `).join('')}
+      </div>`;
+  }catch(e){detail.innerHTML='<div style="color:var(--red);font-size:11px;padding:8px">'+esc(e.message)+'</div>'}
+}
+async function editKbDoc(id){
+  // Fetch doc details first
+  try{
+    const r=await fetch('/api/embeddings/documents/'+id);if(!r.ok)return;
+    const d=await r.json();const doc=d.document;
+    // Collapse view and show editor in detail slot
+    _kbViewingDoc=id;
+    document.querySelectorAll('[id^="kbdetail-"]').forEach(el=>el.style.display='none');
+    const detail=$('kbdetail-'+id);if(!detail)return;
+    detail.style.display='block';
+    detail.innerHTML=`
+      <div style="background:var(--surface);border:1px solid var(--accent);border-radius:0 0 8px 8px;margin-top:-4px;margin-bottom:6px;padding:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:.3px;margin-bottom:6px">Edit Document</div>
+        <div style="margin-bottom:6px">
+          <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:2px">TITLE</label>
+          <input id="kbEditName" value="${esc(doc.filename).replace(/"/g,'&quot;')}" style="width:100%;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;box-sizing:border-box">
+        </div>
+        <div style="margin-bottom:6px">
+          <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:2px">CONTENT <span style="font-weight:400">(editing will re-embed all chunks)</span></label>
+          <textarea id="kbEditContent" rows="10" style="width:100%;padding:6px 8px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;line-height:1.5;resize:vertical;font-family:inherit;box-sizing:border-box">${esc(doc.content)}</textarea>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="mbtn" style="font-size:11px;color:var(--green);border-color:var(--green)" onclick="saveKbDoc('${esc(id)}')">Save</button>
+          <button class="mbtn" style="font-size:11px" onclick="viewKbDoc('${esc(id)}')">Cancel</button>
+          <span id="kbEditStatus" style="font-size:11px;margin-left:6px"></span>
+        </div>
+      </div>`;
+  }catch(e){}
+}
+async function saveKbDoc(id){
+  const st=$('kbEditStatus');
+  const filename=$('kbEditName').value.trim();
+  const content=$('kbEditContent').value;
+  if(!filename){st.innerHTML='<span style="color:var(--red)">Title required</span>';return}
+  st.innerHTML='<span style="color:var(--text-dim)">Saving & re-embedding...</span>';
+  try{
+    const r=await fetch('/api/embeddings/documents/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename,content})});
+    const d=await r.json();
+    if(d.ok){
+      st.innerHTML='<span style="color:var(--green)">Saved!'+(d.re_embedded?' Re-embedded '+d.chunk_count+' chunks.':'')+'</span>';
+      setTimeout(()=>{_kbViewingDoc=id;loadKnowledge()},800);
+    }else st.innerHTML='<span style="color:var(--red)">Error: '+esc(d.error||'Unknown')+'</span>';
+  }catch(e){st.innerHTML='<span style="color:var(--red)">'+esc(e.message)+'</span>'}
+}
+async function loadKbStats(){
+  try{
+    const r=await fetch('/api/embeddings/stats');if(!r.ok)return;
+    const d=await r.json();
+    const size=d.db_size_bytes>1048576?(d.db_size_bytes/1048576).toFixed(1)+' MB':d.db_size_bytes>1024?(d.db_size_bytes/1024).toFixed(0)+' KB':d.db_size_bytes+' B';
+    $('kbStats').innerHTML=`<div style="display:flex;gap:16px;font-size:12px"><span>Docs: <strong>${d.documents}</strong></span><span>Chunks: <strong>${d.chunks}</strong></span><span>Size: <strong>${size}</strong></span></div>`;
+  }catch(e){}
+}
+async function uploadKbFile(){
+  const fileInput=$('kbFileInput');
+  if(!fileInput.files?.length){$('kbUploadStatus').innerHTML='<span style="color:var(--red)">Select a file first</span>';return}
+  const file=fileInput.files[0];
+  const st=$('kbUploadStatus');st.innerHTML='<span style="color:var(--text-dim)">Uploading & embedding...</span>';
+  const fd=new FormData();fd.append('file',file);
+  try{
+    const r=await fetch('/api/embeddings/upload',{method:'POST',body:fd});
+    const d=await r.json();
+    if(d.ok){st.innerHTML='<span style="color:var(--green)">Uploaded: '+esc(d.filename)+' ('+d.chunk_count+' chunks)</span>';fileInput.value='';loadKnowledge()}
+    else st.innerHTML='<span style="color:var(--red)">Error: '+esc(d.error||'Unknown')+'</span>';
+  }catch(e){st.innerHTML='<span style="color:var(--red)">'+esc(e.message)+'</span>'}
+}
+async function uploadKbText(){
+  const title=$('kbTextTitle').value.trim()||'Untitled';
+  const content=$('kbTextContent').value.trim();
+  if(!content){$('kbUploadStatus').innerHTML='<span style="color:var(--red)">Enter some text</span>';return}
+  const st=$('kbUploadStatus');st.innerHTML='<span style="color:var(--text-dim)">Embedding text...</span>';
+  try{
+    const r=await fetch('/api/embeddings/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,content})});
+    const d=await r.json();
+    if(d.ok){st.innerHTML='<span style="color:var(--green)">Added: '+esc(d.filename)+' ('+d.chunk_count+' chunks)</span>';$('kbTextTitle').value='';$('kbTextContent').value='';loadKnowledge()}
+    else st.innerHTML='<span style="color:var(--red)">Error: '+esc(d.error||'Unknown')+'</span>';
+  }catch(e){st.innerHTML='<span style="color:var(--red)">'+esc(e.message)+'</span>'}
+}
+async function deleteKbDoc(id){
+  if(!confirm('Delete this document and all its embeddings?'))return;
+  try{
+    await fetch('/api/embeddings/documents/'+id,{method:'DELETE'});
+    loadKnowledge();
+  }catch(e){}
+}
+async function searchKb(){
+  const q=$('kbSearchInput').value.trim();if(!q)return;
+  const res=$('kbSearchResults');res.innerHTML='<span style="color:var(--text-dim);font-size:11px">Searching...</span>';
+  try{
+    const r=await fetch('/api/embeddings/search?q='+encodeURIComponent(q));
+    const d=await r.json();
+    if(d.error){res.innerHTML='<span style="color:var(--red);font-size:11px">'+esc(d.error)+'</span>';return}
+    if(!d.results?.length){res.innerHTML='<span style="color:var(--text-dim);font-size:11px">No results</span>';return}
+    res.innerHTML=d.results.map(r=>{
+      const simColor=r.similarity>0.7?'var(--green)':r.similarity>0.4?'var(--orange)':'var(--text-dim)';
+      return`<div class="ucard" style="padding:6px 8px;margin-bottom:3px"><div style="display:flex;gap:6px;margin-bottom:2px"><span style="font-size:10px;font-weight:600;color:${simColor}">${(r.similarity*100).toFixed(1)}%</span><span style="font-size:10px;color:var(--text-dim)">${r.token_count||'?'} tokens</span></div><div style="font-size:11px;color:var(--text);line-height:1.4;max-height:60px;overflow:hidden">${esc(r.content.slice(0,200))}${r.content.length>200?'...':''}</div></div>`;
+    }).join('');
+  }catch(e){res.innerHTML='<span style="color:var(--red);font-size:11px">'+esc(e.message)+'</span>'}
+}
 
 // ---- Init ----
 (async()=>{

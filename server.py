@@ -14,9 +14,11 @@ import hashlib
 import os
 import re
 import secrets
+import struct
 import sys
 import time
 import uuid
+import io
 import threading
 import queue
 from collections import defaultdict
@@ -27,6 +29,25 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from pathlib import Path
+import sqlite3  # always available
+
+try:
+    import pyodbc
+    HAS_PYODBC = True
+except ImportError:
+    HAS_PYODBC = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+try:
+    import tiktoken
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
 
 # ---------------------------------------------------------------------------
 # OpenAI OAuth PKCE constants (from Codex CLI)
@@ -63,6 +84,20 @@ config = {
     "openai_oauth_token": "",
     "openai_refresh_token": "",
     "openai_token_expires": 0,
+    "db_type": "",              # "" | "mssql" | "sqlite"
+    "db_mssql_server": "",
+    "db_mssql_database": "",
+    "db_mssql_user": "",
+    "db_mssql_password": "",
+    "db_mssql_driver": "",
+    "db_sqlite_path": "",
+    "db_enabled": False,
+    "db_schema_cache": "",
+    "rag_enabled": False,
+    "rag_top_k": 5,
+    "rag_chunk_size": 500,
+    "embedding_provider": "auto",  # "auto"|"openai"|"ollama"
+    "embedding_model": "",
 }
 config_lock = threading.Lock()
 
@@ -225,6 +260,7 @@ threading.Thread(target=_cleanup_sessions_loop, daemon=True).start()
 # Chat memory — per-session conversation history
 # ---------------------------------------------------------------------------
 chat_sessions: dict[str, list[dict]] = {}  # session_id -> messages
+chat_session_meta: dict[str, dict] = {}  # session_id -> {username, created_at, last_activity, model}
 chat_sessions_lock = threading.Lock()
 MAX_CHAT_HISTORY = 20
 
@@ -234,19 +270,35 @@ def get_chat_history(session_id: str) -> list[dict]:
         return list(chat_sessions.get(session_id, []))
 
 
-def append_chat_message(session_id: str, role: str, content: str):
+def append_chat_message(session_id: str, role: str, content: str, username: str = "", model: str = ""):
+    now = time.time()
     with chat_sessions_lock:
         if session_id not in chat_sessions:
             chat_sessions[session_id] = []
-        chat_sessions[session_id].append({"role": role, "content": content})
+        chat_sessions[session_id].append({"role": role, "content": content, "timestamp": now})
         # Trim to max history (keep last MAX_CHAT_HISTORY messages)
         if len(chat_sessions[session_id]) > MAX_CHAT_HISTORY:
             chat_sessions[session_id] = chat_sessions[session_id][-MAX_CHAT_HISTORY:]
+        # Update session metadata
+        if session_id not in chat_session_meta:
+            chat_session_meta[session_id] = {
+                "username": username,
+                "created_at": now,
+                "last_activity": now,
+                "model": model,
+            }
+        else:
+            chat_session_meta[session_id]["last_activity"] = now
+            if username:
+                chat_session_meta[session_id]["username"] = username
+            if model:
+                chat_session_meta[session_id]["model"] = model
 
 
 def clear_chat_history(session_id: str):
     with chat_sessions_lock:
         chat_sessions.pop(session_id, None)
+        chat_session_meta.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +403,7 @@ def _start_oauth_callback_server(state: str):
 
 
 def refresh_openai_token() -> str | None:
-    """Use refresh_token to get a new access token. Returns new token or None."""
+    """Use refresh_token to get a new access token. Also attempts API key exchange. Returns new token or None."""
     with config_lock:
         refresh_tok = config.get("openai_refresh_token", "")
     if not refresh_tok:
@@ -362,7 +414,7 @@ def refresh_openai_token() -> str | None:
             "grant_type": "refresh_token",
             "client_id": OPENAI_CLIENT_ID,
             "refresh_token": refresh_tok,
-            "scope": "openid profile email",
+            "scope": "openid profile email offline_access",
         }).encode("utf-8")
         req = Request(
             OPENAI_TOKEN_URL, data=body,
@@ -372,15 +424,41 @@ def refresh_openai_token() -> str | None:
         resp = urlopen(req, timeout=10)
         result = json.loads(resp.read())
         access_token = result.get("access_token", "")
+        id_token = result.get("id_token", "")
         new_refresh = result.get("refresh_token", refresh_tok)
         expires_in = result.get("expires_in", 3600)
+
+        # Try to exchange id_token for API key
+        api_key = ""
+        if id_token:
+            try:
+                exchange_body = urlencode({
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "client_id": OPENAI_CLIENT_ID,
+                    "subject_token": id_token,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                    "audience": "https://api.openai.com/v1",
+                }).encode("utf-8")
+                req2 = Request(
+                    OPENAI_TOKEN_URL, data=exchange_body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                resp2 = urlopen(req2, timeout=10)
+                result2 = json.loads(resp2.read())
+                api_key = result2.get("access_token", "")
+                print(f"[oauth] Refresh token exchange succeeded, got API key: {bool(api_key)}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[oauth] Refresh token exchange for API key failed: {exc}", file=sys.stderr)
 
         with config_lock:
             config["openai_oauth_token"] = access_token
             config["openai_refresh_token"] = new_refresh
             config["openai_token_expires"] = time.time() + expires_in - 60
+            if api_key:
+                config["openai_api_key"] = api_key
         save_config()
-        return access_token
+        return api_key if api_key else access_token
     except Exception as e:
         print(f"[oauth] Token refresh failed: {e}", file=sys.stderr)
         return None
@@ -656,6 +734,88 @@ def _using_oauth_token() -> bool:
     return has_oauth and not has_api_key
 
 
+def _call_openai_chat_completions(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float) -> str:
+    """Call OpenAI Chat Completions API."""
+    if not model:
+        model = "gpt-4o-mini"
+    body = {"model": model, "messages": messages}
+    if temperature is not None:
+        body["temperature"] = temperature
+    data = json.dumps(body).encode("utf-8")
+    print(f"[openai] Chat Completions request: model={model}, messages={len(messages)}", file=sys.stderr)
+    req = Request(
+        f"{base_url}/chat/completions", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {bearer}",
+        },
+        method="POST",
+    )
+    try:
+        resp = urlopen(req, timeout=120)
+    except Exception as e:
+        if hasattr(e, 'read'):
+            try:
+                err_body = e.read().decode()
+                print(f"[openai] Chat Completions error body: {err_body}", file=sys.stderr)
+            except Exception:
+                pass
+        raise
+    result = json.loads(resp.read())
+    return result["choices"][0]["message"]["content"]
+
+
+def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float) -> str:
+    """Call OpenAI Responses API (for OAuth tokens)."""
+    if not model:
+        model = "gpt-4o-mini"
+    system_text = ""
+    input_parts = []
+    for m in messages:
+        if m["role"] == "system":
+            system_text = m["content"]
+        else:
+            input_parts.append(m)
+
+    body = {"model": model}
+    if system_text:
+        body["instructions"] = system_text
+    body["input"] = [{"role": m["role"], "content": m["content"]} for m in input_parts]
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    data = json.dumps(body).encode("utf-8")
+    print(f"[openai] Responses API request: model={model}, input_parts={len(input_parts)}", file=sys.stderr)
+    req = Request(
+        f"{base_url}/responses", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {bearer}",
+        },
+        method="POST",
+    )
+    try:
+        resp = urlopen(req, timeout=120)
+    except Exception as e:
+        if hasattr(e, 'read'):
+            try:
+                err_body = e.read().decode()
+                print(f"[openai] Responses API error body: {err_body}", file=sys.stderr)
+            except Exception:
+                pass
+        raise
+    result = json.loads(resp.read())
+    answer = ""
+    for item in result.get("output", []):
+        if item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text":
+                    answer += c.get("text", "")
+    if not answer:
+        answer = result.get("output_text", "") or str(result)
+    return answer
+
+
 def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
     with config_lock:
         base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
@@ -664,68 +824,26 @@ def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[s
     if not bearer:
         raise ValueError("OpenAI API key not configured — use Login with OpenAI or set an API key in Settings")
 
-    use_responses_api = _using_oauth_token()
+    use_oauth = _using_oauth_token()
 
     start = time.time()
 
-    if use_responses_api:
-        # ChatGPT subscription OAuth tokens must use the Responses API
-        # Convert messages to a single input string for simple queries,
-        # or use the instructions + input pattern for system + user messages
-        system_text = ""
-        input_parts = []
-        for m in messages:
-            if m["role"] == "system":
-                system_text = m["content"]
-            else:
-                input_parts.append(m)
-
-        body = {"model": model}
-        if system_text:
-            body["instructions"] = system_text
-        # Build input as conversation messages
-        body["input"] = [{"role": m["role"], "content": m["content"]} for m in input_parts]
-        if temperature is not None:
-            body["temperature"] = temperature
-
-        data = json.dumps(body).encode("utf-8")
-        req = Request(
-            f"{base_url}/responses", data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {bearer}",
-            },
-            method="POST",
-        )
-        resp = urlopen(req, timeout=120)
-        result = json.loads(resp.read())
-        # Extract text from Responses API output
-        answer = ""
-        for item in result.get("output", []):
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        answer += c.get("text", "")
-        if not answer:
-            answer = result.get("output_text", "") or str(result)
+    if use_oauth:
+        # OAuth token: try Chat Completions first (more reliable with OAuth), then Responses API
+        try:
+            answer = _call_openai_chat_completions(base_url, bearer, messages, model, temperature)
+        except Exception as e1:
+            print(f"[openai] Chat Completions API failed: {e1}", file=sys.stderr)
+            # If 429 rate limit, don't bother trying the other API
+            if "429" in str(e1):
+                raise ValueError("OpenAI rate limit reached — your account usage limit may be exceeded. Please wait or check your OpenAI plan.")
+            try:
+                answer = _call_openai_responses(base_url, bearer, messages, model, temperature)
+            except Exception as e2:
+                print(f"[openai] Responses API also failed: {e2}", file=sys.stderr)
+                raise ValueError(f"OpenAI API call failed. Error: {e1}")
     else:
-        # Standard API key — use Chat Completions API
-        body = {"model": model, "messages": messages}
-        if temperature is not None:
-            body["temperature"] = temperature
-
-        data = json.dumps(body).encode("utf-8")
-        req = Request(
-            f"{base_url}/chat/completions", data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {bearer}",
-            },
-            method="POST",
-        )
-        resp = urlopen(req, timeout=120)
-        result = json.loads(resp.read())
-        answer = result["choices"][0]["message"]["content"]
+        answer = _call_openai_chat_completions(base_url, bearer, messages, model, temperature)
 
     duration_ms = (time.time() - start) * 1000
     return answer, round(duration_ms, 1)
@@ -867,7 +985,9 @@ def list_models() -> list[dict]:
                 for m in models
                 if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "o4", "chatgpt-"))
             ]
-            return sorted(chat_models, key=lambda x: x["name"]) if chat_models else OPENAI_MODELS
+            if chat_models:
+                return sorted(chat_models, key=lambda x: x["name"])
+            return OPENAI_MODELS
         except Exception:
             return OPENAI_MODELS
 
@@ -902,6 +1022,535 @@ def list_models() -> list[dict]:
             return [{"name": m["name"], "size": m.get("size", 0)} for m in models]
         except Exception:
             return []
+
+
+# ---------------------------------------------------------------------------
+# Database connection module
+# ---------------------------------------------------------------------------
+_db_thread_local = threading.local()
+
+
+def get_db_connection():
+    """Return a DB connection or None, cached per-thread."""
+    with config_lock:
+        db_type = config.get("db_type", "")
+        db_enabled = config.get("db_enabled", False)
+    if not db_enabled or not db_type:
+        return None
+
+    # Check if we already have a connection for this thread
+    existing = getattr(_db_thread_local, "conn", None)
+    existing_type = getattr(_db_thread_local, "conn_type", "")
+    if existing and existing_type == db_type:
+        try:
+            # Test if connection is still alive
+            if db_type == "sqlite":
+                existing.execute("SELECT 1")
+            else:
+                existing.execute("SELECT 1")
+            return existing
+        except Exception:
+            try:
+                existing.close()
+            except Exception:
+                pass
+            _db_thread_local.conn = None
+
+    try:
+        if db_type == "mssql":
+            if not HAS_PYODBC:
+                return None
+            with config_lock:
+                server = config.get("db_mssql_server", "")
+                database = config.get("db_mssql_database", "")
+                user = config.get("db_mssql_user", "")
+                password = config.get("db_mssql_password", "")
+                driver = config.get("db_mssql_driver", "ODBC Driver 17 for SQL Server")
+            conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password}"
+            conn = pyodbc.connect(conn_str, timeout=10)
+            _db_thread_local.conn = conn
+            _db_thread_local.conn_type = db_type
+            return conn
+        elif db_type == "sqlite":
+            with config_lock:
+                db_path = config.get("db_sqlite_path", "")
+            if not db_path:
+                return None
+            # Resolve relative paths against data dir
+            p = Path(db_path)
+            if not p.is_absolute():
+                p = DATA_DIR / db_path
+            conn = sqlite3.connect(str(p), timeout=10)
+            conn.row_factory = sqlite3.Row
+            _db_thread_local.conn = conn
+            _db_thread_local.conn_type = db_type
+            return conn
+    except Exception as e:
+        print(f"[db] Connection error: {e}", file=sys.stderr)
+    return None
+
+
+def get_db_schema(force_refresh=False) -> str:
+    """Discover tables + columns. Returns formatted string for LLM."""
+    with config_lock:
+        cached = config.get("db_schema_cache", "")
+    if cached and not force_refresh:
+        return cached
+
+    conn = get_db_connection()
+    if not conn:
+        return ""
+
+    with config_lock:
+        db_type = config.get("db_type", "")
+
+    schema_lines = []
+    try:
+        if db_type == "mssql":
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+                "FROM INFORMATION_SCHEMA.COLUMNS ORDER BY TABLE_NAME, ORDINAL_POSITION"
+            )
+            current_table = None
+            for row in cursor.fetchall():
+                tbl, col, dtype = row[0], row[1], row[2]
+                if tbl != current_table:
+                    current_table = tbl
+                    schema_lines.append(f"\nTable: {tbl}")
+                schema_lines.append(f"  - {col} ({dtype})")
+            cursor.close()
+        elif db_type == "sqlite":
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            tables = [r[0] if not isinstance(r, sqlite3.Row) else r["name"] for r in cursor.fetchall()]
+            for tbl in tables:
+                schema_lines.append(f"\nTable: {tbl}")
+                cursor.execute(f"PRAGMA table_info(`{tbl}`)")
+                for col_info in cursor.fetchall():
+                    col_name = col_info[1] if not isinstance(col_info, sqlite3.Row) else col_info["name"]
+                    col_type = col_info[2] if not isinstance(col_info, sqlite3.Row) else col_info["type"]
+                    schema_lines.append(f"  - {col_name} ({col_type})")
+            cursor.close()
+    except Exception as e:
+        print(f"[db] Schema error: {e}", file=sys.stderr)
+        return f"Error reading schema: {e}"
+
+    schema = "\n".join(schema_lines).strip()
+    with config_lock:
+        config["db_schema_cache"] = schema
+    save_config()
+    return schema
+
+
+_WRITE_SQL_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|REPLACE|MERGE|EXEC|EXECUTE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+
+
+def execute_db_query(sql: str, params=None) -> dict:
+    """Execute a SELECT query safely. Returns result dict."""
+    # Read-only check
+    if _WRITE_SQL_RE.search(sql):
+        return {"error": "Only SELECT queries are allowed", "columns": [], "rows": [], "row_count": 0, "duration_ms": 0}
+
+    conn = get_db_connection()
+    if not conn:
+        return {"error": "No database connection", "columns": [], "rows": [], "row_count": 0, "duration_ms": 0}
+
+    with config_lock:
+        db_type = config.get("db_type", "")
+
+    start = time.time()
+    try:
+        cursor = conn.cursor()
+        if db_type == "mssql":
+            cursor.execute(sql, params or ())
+        else:
+            cursor.execute(sql, params or ())
+
+        if cursor.description is None:
+            cursor.close()
+            return {"error": "Query returned no results", "columns": [], "rows": [], "row_count": 0,
+                    "duration_ms": round((time.time() - start) * 1000, 1)}
+
+        columns = [desc[0] for desc in cursor.description]
+        rows_raw = cursor.fetchmany(100)  # limit to 100 rows
+        rows = [dict(zip(columns, row)) for row in rows_raw]
+        row_count = len(rows)
+        cursor.close()
+        duration_ms = round((time.time() - start) * 1000, 1)
+
+        # Log as event
+        ingest_event({
+            "type": "query",
+            "sql": sql,
+            "row_count": row_count,
+            "duration_ms": duration_ms,
+            "results": rows[:10],  # only store first 10 in event for feed
+        })
+
+        return {"columns": columns, "rows": rows, "row_count": row_count, "duration_ms": duration_ms}
+    except Exception as e:
+        duration_ms = round((time.time() - start) * 1000, 1)
+        return {"error": str(e), "columns": [], "rows": [], "row_count": 0, "duration_ms": duration_ms}
+
+
+# ---------------------------------------------------------------------------
+# Embedding store
+# ---------------------------------------------------------------------------
+EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
+
+
+def init_embedding_db():
+    """Create embedding tables if they don't exist."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(EMBEDDINGS_DB))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            filename TEXT,
+            content TEXT,
+            chunk_count INTEGER,
+            uploaded_by TEXT,
+            uploaded_at REAL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id TEXT PRIMARY KEY,
+            doc_id TEXT REFERENCES documents(id),
+            content TEXT,
+            chunk_index INTEGER,
+            embedding BLOB,
+            token_count INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _get_embedding_conn():
+    """Get a connection to the embeddings database."""
+    return sqlite3.connect(str(EMBEDDINGS_DB))
+
+
+def embed_text(text: str) -> list:
+    """Get embedding vector for text. Returns list of floats."""
+    with config_lock:
+        provider = config.get("embedding_provider", "auto")
+        model = config.get("embedding_model", "")
+        openai_key = config.get("openai_api_key", "")
+        ollama_url = config.get("ollama_url", "http://localhost:11434")
+
+    # Auto-detect provider
+    if provider == "auto":
+        if openai_key:
+            provider = "openai"
+        else:
+            provider = "ollama"
+
+    if provider == "openai":
+        if not model:
+            model = "text-embedding-3-small"
+        bearer = get_openai_bearer_token()
+        if not bearer:
+            raise ValueError("No OpenAI API key available for embeddings")
+        with config_lock:
+            base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+        body = json.dumps({"model": model, "input": text}).encode("utf-8")
+        req = Request(
+            f"{base_url}/embeddings", data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"},
+            method="POST",
+        )
+        resp = urlopen(req, timeout=30)
+        result = json.loads(resp.read())
+        return result["data"][0]["embedding"]
+
+    elif provider == "ollama":
+        if not model:
+            model = "nomic-embed-text"
+        body = json.dumps({"model": model, "prompt": text}).encode("utf-8")
+        req = Request(
+            f"{ollama_url}/api/embeddings", data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urlopen(req, timeout=60)
+        result = json.loads(resp.read())
+        return result.get("embedding", [])
+
+    raise ValueError(f"Unknown embedding provider: {provider}")
+
+
+def chunk_text(text: str, chunk_size: int = 500) -> list:
+    """Split text into chunks by paragraphs, respecting token limits."""
+    paragraphs = re.split(r"\n\s*\n", text)
+    chunks = []
+    current_chunk = ""
+
+    def _count_tokens(t):
+        if HAS_TIKTOKEN:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+                return len(enc.encode(t))
+            except Exception:
+                pass
+        return len(t) // 4  # rough fallback
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        para_tokens = _count_tokens(para)
+        if para_tokens > chunk_size:
+            # Split long paragraph by sentences
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            for sent in sentences:
+                if _count_tokens(current_chunk + " " + sent) > chunk_size and current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = sent
+                else:
+                    current_chunk = (current_chunk + " " + sent).strip()
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+        elif _count_tokens(current_chunk + "\n\n" + para) > chunk_size and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = para
+        else:
+            current_chunk = (current_chunk + "\n\n" + para).strip()
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def store_document(filename: str, content: str, username: str) -> dict:
+    """Chunk, embed, and store a document. Returns doc info."""
+    with config_lock:
+        cs = config.get("rag_chunk_size", 500)
+
+    doc_id = str(uuid.uuid4())
+    chunks = chunk_text(content, cs)
+
+    conn = _get_embedding_conn()
+    try:
+        conn.execute(
+            "INSERT INTO documents (id, filename, content, chunk_count, uploaded_by, uploaded_at) VALUES (?,?,?,?,?,?)",
+            (doc_id, filename, content, len(chunks), username, time.time()),
+        )
+
+        for i, chunk_content in enumerate(chunks):
+            chunk_id = str(uuid.uuid4())
+            try:
+                embedding = embed_text(chunk_content)
+                if HAS_NUMPY:
+                    emb_blob = np.array(embedding, dtype=np.float32).tobytes()
+                else:
+                    emb_blob = struct.pack(f"{len(embedding)}f", *embedding)
+            except Exception as e:
+                print(f"[embed] Error embedding chunk {i}: {e}", file=sys.stderr)
+                emb_blob = b""
+
+            token_count = len(chunk_content) // 4
+            if HAS_TIKTOKEN:
+                try:
+                    enc = tiktoken.get_encoding("cl100k_base")
+                    token_count = len(enc.encode(chunk_content))
+                except Exception:
+                    pass
+
+            conn.execute(
+                "INSERT INTO chunks (id, doc_id, content, chunk_index, embedding, token_count) VALUES (?,?,?,?,?,?)",
+                (chunk_id, doc_id, chunk_content, i, emb_blob, token_count),
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"doc_id": doc_id, "filename": filename, "chunk_count": len(chunks)}
+
+
+def search_embeddings(query: str, top_k: int = 5) -> list:
+    """Embed query and find top-K similar chunks using cosine similarity."""
+    if not HAS_NUMPY:
+        return []
+
+    try:
+        query_emb = np.array(embed_text(query), dtype=np.float32)
+    except Exception as e:
+        print(f"[rag] Error embedding query: {e}", file=sys.stderr)
+        return []
+
+    conn = _get_embedding_conn()
+    try:
+        cursor = conn.execute("SELECT id, doc_id, content, embedding, token_count FROM chunks WHERE embedding != ''")
+        results = []
+        for row in cursor.fetchall():
+            chunk_id, doc_id, content, emb_blob, token_count = row
+            if not emb_blob:
+                continue
+            try:
+                emb = np.frombuffer(emb_blob, dtype=np.float32)
+                if len(emb) != len(query_emb):
+                    continue
+                # Cosine similarity
+                dot = np.dot(query_emb, emb)
+                norm = np.linalg.norm(query_emb) * np.linalg.norm(emb)
+                if norm == 0:
+                    continue
+                similarity = float(dot / norm)
+                results.append({
+                    "chunk_id": chunk_id,
+                    "doc_id": doc_id,
+                    "content": content,
+                    "similarity": round(similarity, 4),
+                    "token_count": token_count,
+                })
+            except Exception:
+                continue
+
+        results.sort(key=lambda x: -x["similarity"])
+        return results[:top_k]
+    finally:
+        conn.close()
+
+
+def delete_document(doc_id: str) -> bool:
+    """Remove document and all its chunks."""
+    conn = _get_embedding_conn()
+    try:
+        conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+        conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[embed] Error deleting doc {doc_id}: {e}", file=sys.stderr)
+        return False
+    finally:
+        conn.close()
+
+
+def get_embedding_stats() -> dict:
+    """Return stats about the embedding store."""
+    conn = _get_embedding_conn()
+    try:
+        doc_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        db_size = EMBEDDINGS_DB.stat().st_size if EMBEDDINGS_DB.exists() else 0
+        return {"documents": doc_count, "chunks": chunk_count, "db_size_bytes": db_size}
+    except Exception:
+        return {"documents": 0, "chunks": 0, "db_size_bytes": 0}
+    finally:
+        conn.close()
+
+
+def list_documents() -> list:
+    """List all documents with metadata."""
+    conn = _get_embedding_conn()
+    try:
+        cursor = conn.execute("SELECT id, filename, chunk_count, uploaded_by, uploaded_at FROM documents ORDER BY uploaded_at DESC")
+        return [
+            {"id": r[0], "filename": r[1], "chunk_count": r[2], "uploaded_by": r[3], "uploaded_at": r[4]}
+            for r in cursor.fetchall()
+        ]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def get_document_detail(doc_id: str) -> dict | None:
+    """Get full document with content and all chunks."""
+    conn = _get_embedding_conn()
+    try:
+        row = conn.execute("SELECT id, filename, content, chunk_count, uploaded_by, uploaded_at FROM documents WHERE id=?", (doc_id,)).fetchone()
+        if not row:
+            return None
+        doc = {"id": row[0], "filename": row[1], "content": row[2], "chunk_count": row[3], "uploaded_by": row[4], "uploaded_at": row[5]}
+        chunks_cursor = conn.execute("SELECT id, content, chunk_index, token_count FROM chunks WHERE doc_id=? ORDER BY chunk_index", (doc_id,))
+        doc["chunks"] = [
+            {"id": r[0], "content": r[1], "chunk_index": r[2], "token_count": r[3]}
+            for r in chunks_cursor.fetchall()
+        ]
+        return doc
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def update_document(doc_id: str, filename: str | None, content: str | None, username: str) -> dict:
+    """Update a document. If content changed, re-chunk and re-embed."""
+    conn = _get_embedding_conn()
+    try:
+        row = conn.execute("SELECT id, filename, content, chunk_count FROM documents WHERE id=?", (doc_id,)).fetchone()
+        if not row:
+            return {"error": "Document not found"}
+
+        old_filename, old_content, old_chunk_count = row[1], row[2], row[3]
+        new_filename = filename if filename is not None else old_filename
+        new_content = content if content is not None else old_content
+
+        content_changed = (new_content != old_content)
+
+        if content_changed:
+            # Re-chunk and re-embed
+            with config_lock:
+                cs = config.get("rag_chunk_size", 500)
+            chunks = chunk_text(new_content, cs)
+
+            # Delete old chunks
+            conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+
+            # Insert new chunks
+            for i, chunk_content in enumerate(chunks):
+                chunk_id = str(uuid.uuid4())
+                try:
+                    embedding = embed_text(chunk_content)
+                    if HAS_NUMPY:
+                        emb_blob = np.array(embedding, dtype=np.float32).tobytes()
+                    else:
+                        emb_blob = struct.pack(f"{len(embedding)}f", *embedding)
+                except Exception as e:
+                    print(f"[embed] Error embedding chunk {i}: {e}", file=sys.stderr)
+                    emb_blob = b""
+
+                token_count = len(chunk_content) // 4
+                if HAS_TIKTOKEN:
+                    try:
+                        enc = tiktoken.get_encoding("cl100k_base")
+                        token_count = len(enc.encode(chunk_content))
+                    except Exception:
+                        pass
+
+                conn.execute(
+                    "INSERT INTO chunks (id, doc_id, content, chunk_index, embedding, token_count) VALUES (?,?,?,?,?,?)",
+                    (chunk_id, doc_id, chunk_content, i, emb_blob, token_count),
+                )
+
+            conn.execute("UPDATE documents SET filename=?, content=?, chunk_count=?, uploaded_by=?, uploaded_at=? WHERE id=?",
+                         (new_filename, new_content, len(chunks), username, time.time(), doc_id))
+        else:
+            # Only rename
+            conn.execute("UPDATE documents SET filename=? WHERE id=?", (new_filename, doc_id))
+
+        conn.commit()
+        return {"ok": True, "doc_id": doc_id, "filename": new_filename,
+                "chunk_count": len(chunks) if content_changed else old_chunk_count,
+                "re_embedded": content_changed}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1679,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     # --- Auth helpers ---
@@ -1046,13 +1695,19 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 break
         return get_session_by_id(sid), sid
 
+    # Role hierarchy: admin > mitarbeiter > user
+    _ROLE_LEVEL = {"admin": 3, "mitarbeiter": 2, "user": 1}
+
     def _require_auth(self, role: str = "user") -> dict | None:
-        """Returns session if authorized, sends 401/403 and returns None otherwise."""
+        """Returns session if authorized, sends 401/403 and returns None otherwise.
+        Role check uses hierarchy: admin > mitarbeiter > user."""
         session, _ = self._get_session()
         if not session:
             self._send_json({"error": "not_authenticated"}, 401)
             return None
-        if role == "admin" and session.get("role") != "admin":
+        required_level = self._ROLE_LEVEL.get(role, 1)
+        user_level = self._ROLE_LEVEL.get(session.get("role", "user"), 1)
+        if user_level < required_level:
             self._send_json({"error": "forbidden"}, 403)
             return None
         return session
@@ -1138,6 +1793,50 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 return
             return self._handle_user_action(path)
 
+        # Database endpoints (admin-only)
+        if path == "/api/db/test":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_db_test()
+        if path == "/api/db/query":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_db_query()
+
+        # Embedding endpoints (admin-only)
+        if path == "/api/embeddings/upload":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_embeddings_upload(session)
+        if path == "/api/embeddings/text":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_embeddings_text(session)
+
+        self._send_json({"error": "Not found"}, 404)
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if path.startswith("/api/embeddings/documents/"):
+            session = self._require_auth("admin")
+            if not session:
+                return
+            doc_id = path.split("/api/embeddings/documents/", 1)[1].rstrip("/")
+            return self._handle_embeddings_delete(doc_id)
+        self._send_json({"error": "Not found"}, 404)
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        if path.startswith("/api/embeddings/documents/"):
+            session = self._require_auth("admin")
+            if not session:
+                return
+            doc_id = path.split("/api/embeddings/documents/", 1)[1].rstrip("/")
+            return self._handle_embeddings_update(doc_id, session)
         self._send_json({"error": "Not found"}, 404)
 
     # --- Auth endpoint handlers ---
@@ -1292,6 +1991,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             "code_challenge": challenge,
             "code_challenge_method": "S256",
             "state": state,
+            "audience": "https://api.openai.com/v1",
             "codex_cli_simplified_flow": "true",
             "id_token_add_organizations": "true",
         })
@@ -1361,9 +2061,9 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     exchange_body = urlencode({
                         "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                         "client_id": OPENAI_CLIENT_ID,
-                        "requested_token": "openai-api-key",
                         "subject_token": id_token,
                         "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                        "audience": "https://api.openai.com/v1",
                     }).encode("utf-8")
                     req2 = Request(
                         OPENAI_TOKEN_URL, data=exchange_body,
@@ -1373,8 +2073,16 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     resp2 = urlopen(req2, timeout=10)
                     result2 = json.loads(resp2.read())
                     api_key = result2.get("access_token", "")
-                except Exception:
-                    pass  # API key exchange is optional, fall back to OAuth token
+                    print(f"[oauth] Token exchange succeeded, got API key: {bool(api_key)}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"[oauth] Token exchange for API key failed: {exc}", file=sys.stderr)
+                    # Try reading the error body for more details
+                    if hasattr(exc, 'read'):
+                        try:
+                            err_body = exc.read().decode()
+                            print(f"[oauth] Exchange error body: {err_body}", file=sys.stderr)
+                        except Exception:
+                            pass
 
             with config_lock:
                 config["openai_oauth_token"] = access_token
@@ -1450,19 +2158,63 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             model = data.get("model") or config["default_model"]
             system_prompt = data.get("system_prompt", config["system_prompt"])
             temperature = data.get("temperature", config["temperature"])
+            db_enabled = config.get("db_enabled", False)
+            rag_enabled = config.get("rag_enabled", False)
+            rag_top_k = config.get("rag_top_k", 5)
+
+        # DSGVO: Only mitarbeiter and admin get DB/RAG access
+        user_role = session.get("role", "user")
+        if user_role not in ("admin", "mitarbeiter"):
+            db_enabled = False
+            rag_enabled = False
 
         # Get session ID for chat history
         _, sid = self._get_session()
 
         # Append user message to session history
-        append_chat_message(sid, "user", question)
+        append_chat_message(sid, "user", question, username=user_id, model=model)
 
-        # Build messages: system prompt + history
-        messages = []
+        # Build system prompt with optional DB schema and RAG context
+        system_parts = []
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+            system_parts.append(system_prompt)
+
+        # RAG: inject relevant knowledge base chunks
+        rag_chunks = []
+        has_rag_context = False
+        if rag_enabled:
+            try:
+                rag_chunks = search_embeddings(question, rag_top_k)
+                relevant = [c for c in rag_chunks if c["similarity"] > 0.3]
+                if relevant:
+                    has_rag_context = True
+                    ctx = "\n---\n".join(c["content"] for c in relevant)
+                    system_parts.append(
+                        "KNOWLEDGE BASE (use this to answer factual/company questions directly — do NOT use SQL for information found here):\n---\n" + ctx + "\n---"
+                    )
+            except Exception as e:
+                print(f"[rag] Search error: {e}", file=sys.stderr)
+
+        # DB: inject schema and instruct LLM to generate SQL
+        if db_enabled:
+            schema = get_db_schema()
+            if schema:
+                db_instruction = (
+                    "You also have access to a database. Here is the schema:\n" + schema +
+                    "\n\nIMPORTANT: Only generate a SQL query (wrapped in ```sql ... ```) when the user asks about "
+                    "data, records, statistics, or information that would be stored in these database tables. "
+                    "If the question can be answered from the knowledge base context above or from general knowledge, "
+                    "answer directly WITHOUT SQL. After I execute a SQL query, I'll give you the results to summarize."
+                )
+                system_parts.append(db_instruction)
+
+        # Build messages: combined system prompt + history
+        messages = []
+        if system_parts:
+            messages.append({"role": "system", "content": "\n\n".join(system_parts)})
         messages.extend(get_chat_history(sid))
 
+        total_start = time.time()
         try:
             answer, duration_ms = call_llm(messages, model, temperature)
         except Exception as e:
@@ -1473,18 +2225,72 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, 502)
             return
 
+        # NL-to-SQL: check if LLM returned a SQL block
+        sql_executed = None
+        if db_enabled and "```sql" in answer:
+            sql_match = re.search(r"```sql\s*\n?(.*?)\n?\s*```", answer, re.DOTALL)
+            if sql_match:
+                sql_code = sql_match.group(1).strip()
+                query_result = execute_db_query(sql_code)
+
+                if query_result.get("error"):
+                    # Error — ask LLM to explain
+                    error_msg = f"SQL query failed: {query_result['error']}\nQuery: {sql_code}"
+                    append_chat_message(sid, "assistant", answer, username=user_id, model=model)
+                    append_chat_message(sid, "user", error_msg, username=user_id, model=model)
+                    messages.append({"role": "assistant", "content": answer})
+                    messages.append({"role": "user", "content": error_msg})
+                    try:
+                        answer, extra_ms = call_llm(messages, model, temperature)
+                        duration_ms += extra_ms
+                    except Exception:
+                        pass
+                    sql_executed = {"sql": sql_code, "error": query_result["error"]}
+                else:
+                    # Success — ask LLM to summarize results
+                    rows = query_result["rows"]
+                    result_text = f"Query executed successfully. {query_result['row_count']} rows returned"
+                    if rows:
+                        # Format as markdown table for the LLM
+                        cols = query_result["columns"]
+                        header = " | ".join(cols)
+                        sep = " | ".join("---" for _ in cols)
+                        data_rows = "\n".join(" | ".join(str(r.get(c, "")) for c in cols) for r in rows[:50])
+                        result_text += f":\n\n{header}\n{sep}\n{data_rows}"
+                    result_text += "\n\nPlease summarize these results for the user."
+
+                    append_chat_message(sid, "assistant", answer, username=user_id, model=model)
+                    append_chat_message(sid, "user", result_text, username=user_id, model=model)
+                    messages.append({"role": "assistant", "content": answer})
+                    messages.append({"role": "user", "content": result_text})
+                    try:
+                        answer, extra_ms = call_llm(messages, model, temperature)
+                        duration_ms += extra_ms
+                    except Exception:
+                        pass
+                    sql_executed = {"sql": sql_code, "row_count": query_result["row_count"],
+                                    "duration_ms": query_result["duration_ms"]}
+
+        total_ms = round((time.time() - total_start) * 1000, 1)
+
         # Append assistant response to session history
-        append_chat_message(sid, "assistant", answer)
+        append_chat_message(sid, "assistant", answer, username=user_id, model=model)
 
-        evt = ingest_event({
+        evt_data = {
             "type": "chat", "user_id": user_id, "question": question,
-            "answer": answer, "duration_ms": duration_ms, "model": model,
-        })
+            "answer": answer, "duration_ms": total_ms, "model": model,
+        }
+        if sql_executed:
+            evt_data["sql_executed"] = sql_executed
+        evt = ingest_event(evt_data)
 
-        self._send_json({
+        resp = {
             "ok": True, "id": evt["id"], "answer": answer,
-            "duration_ms": duration_ms, "model": model,
-        })
+            "duration_ms": total_ms, "model": model,
+        }
+        if sql_executed:
+            resp["sql_executed"] = sql_executed
+        self._send_json(resp)
 
     def _handle_clear(self):
         clear_all_events()
@@ -1499,6 +2305,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, 400)
             return
 
+        db_config_changed = False
         with config_lock:
             for key in ("ollama_url", "default_model", "system_prompt", "temperature",
                         "provider", "openai_base_url"):
@@ -1506,13 +2313,35 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     config[key] = data[key]
             # Only update API keys/tokens if a real value is sent (not masked); allow empty to clear
             for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key",
-                         "openai_oauth_token", "openai_refresh_token"):
+                         "openai_oauth_token", "openai_refresh_token", "db_mssql_password"):
                 if key in data and not str(data[key]).startswith("..."):
                     config[key] = data[key]
             if "provider" in data and data["provider"] in ("ollama", "openai", "anthropic", "openrouter"):
                 config["provider"] = data["provider"]
             if "bot_enabled" in data:
                 config["bot_enabled"] = bool(data["bot_enabled"])
+            # DB config keys
+            for key in ("db_type", "db_mssql_server", "db_mssql_database", "db_mssql_user",
+                        "db_mssql_driver", "db_sqlite_path"):
+                if key in data:
+                    if config.get(key) != data[key]:
+                        db_config_changed = True
+                    config[key] = data[key]
+            if "db_enabled" in data:
+                config["db_enabled"] = bool(data["db_enabled"])
+            # RAG config keys
+            if "rag_enabled" in data:
+                config["rag_enabled"] = bool(data["rag_enabled"])
+            for key in ("rag_top_k", "rag_chunk_size"):
+                if key in data:
+                    config[key] = int(data[key])
+            for key in ("embedding_provider", "embedding_model"):
+                if key in data:
+                    config[key] = data[key]
+        # Refresh schema cache if DB config changed
+        if db_config_changed:
+            with config_lock:
+                config["db_schema_cache"] = ""
         save_config()
         with config_lock:
             self._send_json({"ok": True, "config": dict(config)})
@@ -1616,8 +2445,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 self._send_json({"error": str(e)}, 400)
                 return
             new_role = data.get("role")
-            if new_role not in ("admin", "user"):
-                self._send_json({"error": "role must be admin or user"}, 400)
+            if new_role not in ("admin", "mitarbeiter", "user"):
+                self._send_json({"error": "role must be admin, mitarbeiter, or user"}, 400)
                 return
             with accounts_lock:
                 if username not in accounts:
@@ -1759,12 +2588,53 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self._handle_get_accounts()
+        if path == "/api/admin/chats":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_admin_chats()
+        if path.startswith("/api/admin/chats/"):
+            session = self._require_auth("admin")
+            if not session:
+                return
+            chat_sid = path.split("/api/admin/chats/", 1)[1].rstrip("/")
+            return self._handle_admin_chat_detail(chat_sid)
         if path.startswith("/api/users/") and path.count("/") == 3:
             session = self._require_auth("admin")
             if not session:
                 return
             user_id = path.split("/api/users/", 1)[1].rstrip("/")
             return self._handle_get_user(user_id)
+
+        # Database endpoints (admin-only)
+        if path == "/api/db/schema":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_db_schema()
+
+        # Embedding endpoints (read: mitarbeiter+, write: admin only)
+        if path == "/api/embeddings/documents":
+            session = self._require_auth("mitarbeiter")
+            if not session:
+                return
+            return self._handle_embeddings_list()
+        if path.startswith("/api/embeddings/documents/"):
+            session = self._require_auth("mitarbeiter")
+            if not session:
+                return
+            doc_id = path.split("/api/embeddings/documents/", 1)[1].rstrip("/")
+            return self._handle_embeddings_detail(doc_id)
+        if path == "/api/embeddings/search":
+            session = self._require_auth("mitarbeiter")
+            if not session:
+                return
+            return self._handle_embeddings_search(params)
+        if path == "/api/embeddings/stats":
+            session = self._require_auth("mitarbeiter")
+            if not session:
+                return
+            return self._handle_embeddings_stats()
 
         # Static files (public)
         self._serve_static(path)
@@ -1968,7 +2838,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             cfg = dict(config)
         # Mask API keys and tokens — show only last 4 chars
         for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key",
-                     "openai_oauth_token", "openai_refresh_token"):
+                     "openai_oauth_token", "openai_refresh_token", "db_mssql_password"):
             val = cfg.get(key, "")
             if val:
                 cfg[key] = "..." + val[-4:]
@@ -1994,6 +2864,33 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def _handle_get_user(self, user_id: str):
         self._send_json({"user": get_user_summary(user_id)})
 
+    def _handle_admin_chats(self):
+        """GET /api/admin/chats — list all active chat sessions with metadata."""
+        with chat_sessions_lock:
+            result = []
+            for sid, messages in chat_sessions.items():
+                meta = chat_session_meta.get(sid, {})
+                result.append({
+                    "session_id": sid,
+                    "username": meta.get("username", ""),
+                    "message_count": len(messages),
+                    "created_at": meta.get("created_at", 0),
+                    "last_activity": meta.get("last_activity", 0),
+                    "model": meta.get("model", ""),
+                })
+        result.sort(key=lambda x: -x["last_activity"])
+        self._send_json({"sessions": result})
+
+    def _handle_admin_chat_detail(self, session_id: str):
+        """GET /api/admin/chats/<session_id> — return full message history + metadata."""
+        with chat_sessions_lock:
+            messages = list(chat_sessions.get(session_id, []))
+            meta = dict(chat_session_meta.get(session_id, {}))
+        if not messages and not meta:
+            self._send_json({"error": "session not found"}, 404)
+            return
+        self._send_json({"session_id": session_id, "meta": meta, "messages": messages})
+
     def _handle_get_accounts(self):
         with accounts_lock:
             acct_list = []
@@ -2005,6 +2902,197 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     "created_at": a.get("created_at"),
                 })
         self._send_json({"accounts": acct_list})
+
+    # --- Database endpoint handlers ---
+
+    def _handle_db_test(self):
+        """POST /api/db/test — Test database connection."""
+        conn = get_db_connection()
+        if conn is None:
+            with config_lock:
+                db_type = config.get("db_type", "")
+                db_enabled = config.get("db_enabled", False)
+            if not db_type:
+                self._send_json({"ok": False, "error": "No database type configured"})
+                return
+            if not db_enabled:
+                self._send_json({"ok": False, "error": "Database is not enabled"})
+                return
+            if db_type == "mssql" and not HAS_PYODBC:
+                self._send_json({"ok": False, "error": "pyodbc is not installed. Run: pip install pyodbc"})
+                return
+            self._send_json({"ok": False, "error": "Could not connect to database — check your settings"})
+            return
+
+        schema = get_db_schema(force_refresh=True)
+        table_count = schema.count("Table:")
+        self._send_json({"ok": True, "tables": table_count, "schema_preview": schema[:500]})
+
+    def _handle_db_schema(self):
+        """GET /api/db/schema — Return cached schema."""
+        schema = get_db_schema()
+        self._send_json({"schema": schema})
+
+    def _handle_db_query(self):
+        """POST /api/db/query — Execute raw SQL (admin only, for testing)."""
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        sql = data.get("sql", "").strip()
+        if not sql:
+            self._send_json({"error": "sql is required"}, 400)
+            return
+
+        result = execute_db_query(sql)
+        self._send_json(result)
+
+    # --- Embedding endpoint handlers ---
+
+    def _handle_embeddings_list(self):
+        """GET /api/embeddings/documents — List all documents."""
+        docs = list_documents()
+        self._send_json({"documents": docs})
+
+    def _handle_embeddings_upload(self, session: dict):
+        """POST /api/embeddings/upload — Upload a text file (multipart/form-data)."""
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype:
+            self._send_json({"error": "Content-Type must be multipart/form-data"}, 400)
+            return
+
+        try:
+            # Parse boundary from content type
+            boundary = None
+            for part in ctype.split(";"):
+                part = part.strip()
+                if part.startswith("boundary="):
+                    boundary = part[9:].strip('"')
+                    break
+            if not boundary:
+                self._send_json({"error": "No boundary in Content-Type"}, 400)
+                return
+
+            body = self._read_body()
+            # Parse multipart manually (avoid cgi.FieldStorage deprecation)
+            parts = body.split(("--" + boundary).encode())
+            filename = ""
+            file_content = ""
+            for part in parts:
+                if b"Content-Disposition" not in part:
+                    continue
+                # Extract headers and body
+                header_end = part.find(b"\r\n\r\n")
+                if header_end == -1:
+                    continue
+                headers_raw = part[:header_end].decode("utf-8", errors="replace")
+                body_raw = part[header_end + 4:]
+                # Strip trailing \r\n--
+                if body_raw.endswith(b"\r\n"):
+                    body_raw = body_raw[:-2]
+
+                # Get filename if present
+                fn_match = re.search(r'filename="([^"]*)"', headers_raw)
+                name_match = re.search(r'name="([^"]*)"', headers_raw)
+
+                if fn_match and fn_match.group(1):
+                    filename = fn_match.group(1)
+                    file_content = body_raw.decode("utf-8", errors="replace")
+                elif name_match and name_match.group(1) == "filename":
+                    filename = body_raw.decode("utf-8", errors="replace").strip()
+
+            if not file_content:
+                self._send_json({"error": "No file content found"}, 400)
+                return
+            if not filename:
+                filename = "upload.txt"
+
+            result = store_document(filename, file_content, session["username"])
+            self._send_json({"ok": True, **result})
+        except Exception as e:
+            self._send_json({"error": f"Upload failed: {e}"}, 500)
+
+    def _handle_embeddings_text(self, session: dict):
+        """POST /api/embeddings/text — Upload raw text with title."""
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        title = data.get("title", "").strip() or "Untitled"
+        content = data.get("content", "").strip()
+        if not content:
+            self._send_json({"error": "content is required"}, 400)
+            return
+
+        try:
+            result = store_document(title, content, session["username"])
+            self._send_json({"ok": True, **result})
+        except Exception as e:
+            self._send_json({"error": f"Embedding failed: {e}"}, 500)
+
+    def _handle_embeddings_delete(self, doc_id: str):
+        """DELETE /api/embeddings/documents/<id> — Delete a document."""
+        ok = delete_document(doc_id)
+        if ok:
+            self._send_json({"ok": True})
+        else:
+            self._send_json({"error": "Failed to delete document"}, 500)
+
+    def _handle_embeddings_detail(self, doc_id: str):
+        """GET /api/embeddings/documents/<id> — Full document with content and chunks."""
+        doc = get_document_detail(doc_id)
+        if not doc:
+            self._send_json({"error": "Document not found"}, 404)
+            return
+        self._send_json({"document": doc})
+
+    def _handle_embeddings_update(self, doc_id: str, session: dict):
+        """PUT /api/embeddings/documents/<id> — Update document name/content, re-embed if changed."""
+        try:
+            body = self._read_body()
+            data = json.loads(body)
+        except (json.JSONDecodeError, Exception) as e:
+            self._send_json({"error": str(e)}, 400)
+            return
+
+        filename = data.get("filename")
+        content = data.get("content")
+        if filename is None and content is None:
+            self._send_json({"error": "Nothing to update"}, 400)
+            return
+
+        try:
+            result = update_document(doc_id, filename, content, session["username"])
+            if "error" in result:
+                self._send_json(result, 400)
+            else:
+                self._send_json(result)
+        except Exception as e:
+            self._send_json({"error": f"Update failed: {e}"}, 500)
+
+    def _handle_embeddings_search(self, params: dict):
+        """GET /api/embeddings/search?q=... — Test search."""
+        query = (params.get("q") or [""])[0]
+        if not query:
+            self._send_json({"error": "q parameter required"}, 400)
+            return
+        with config_lock:
+            top_k = config.get("rag_top_k", 5)
+        try:
+            results = search_embeddings(query, top_k)
+            self._send_json({"results": results})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_embeddings_stats(self):
+        """GET /api/embeddings/stats — Total docs, chunks, DB size."""
+        self._send_json(get_embedding_stats())
 
 
 # ---------------------------------------------------------------------------
@@ -2027,8 +3115,11 @@ def main():
     ensure_default_admin()
     rebuild_users_from_events()
     save_users()
+    init_embedding_db()
     print(f"[chatbot-monitor] Loaded {len(events)} events, {len(users)} users, {len(accounts)} accounts")
     print(f"[chatbot-monitor] Ollama: {config['ollama_url']}  Model: {config['default_model']}")
+    print(f"[chatbot-monitor] DB: type={config.get('db_type','none')} enabled={config.get('db_enabled',False)}")
+    print(f"[chatbot-monitor] RAG: enabled={config.get('rag_enabled',False)} embeddings_db={EMBEDDINGS_DB}")
 
     server = ThreadedHTTPServer(("0.0.0.0", PORT), MonitorHandler)
     print(f"[chatbot-monitor] Dashboard: http://localhost:{PORT}/")
