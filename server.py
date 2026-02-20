@@ -8,9 +8,11 @@ live updates via SSE.
 Features: cookie-based auth, admin/user roles, bot kill switch, user priorities.
 """
 
+import ast
 import base64
 import json
 import hashlib
+import math
 import os
 import re
 import secrets
@@ -104,6 +106,9 @@ config = {
     "rag_chunk_size": 500,
     "embedding_provider": "auto",  # "auto"|"openai"|"ollama"
     "embedding_model": "",
+    "agent_enabled": False,
+    "agent_max_steps": 8,
+    "agent_web_search": True,
 }
 config_lock = threading.Lock()
 
@@ -710,7 +715,7 @@ def ingest_event(evt: dict) -> dict:
 # ---------------------------------------------------------------------------
 # LLM providers
 # ---------------------------------------------------------------------------
-def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
+def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[str, float, dict]:
     with config_lock:
         ollama_url = config["ollama_url"]
 
@@ -727,11 +732,82 @@ def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[s
     resp = urlopen(req, timeout=120)
     result = json.loads(resp.read())
     answer = result.get("message", {}).get("content", "")
+    # Ollama returns eval_count (output tokens) and prompt_eval_count (input tokens)
+    token_usage = {
+        "prompt_tokens": result.get("prompt_eval_count", 0),
+        "completion_tokens": result.get("eval_count", 0),
+        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_count", 0),
+    }
     duration_ms = (time.time() - start) * 1000
-    return answer, round(duration_ms, 1)
+    return answer, round(duration_ms, 1), token_usage
 
 
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api/codex"
+
+# Codex models that work with ChatGPT backend (NOT standard API models)
+CHATGPT_CODEX_MODELS = [
+    {"name": "gpt-5.3-codex", "size": 0},
+    {"name": "gpt-5.2-codex", "size": 0},
+    {"name": "gpt-5-codex", "size": 0},
+    {"name": "gpt-5-codex-mini", "size": 0},
+    {"name": "gpt-5.2", "size": 0},
+    {"name": "gpt-5", "size": 0},
+    {"name": "gpt-4o", "size": 0},
+]
+
+# Default model for ChatGPT backend
+CHATGPT_DEFAULT_MODEL = "gpt-4o"
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode JWT payload without verification (just to extract claims)."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        # Add padding
+        payload += "=" * (4 - len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+def _get_chatgpt_account_id() -> str:
+    """Extract ChatGPT account ID from stored OAuth token's JWT claims."""
+    with config_lock:
+        token = config.get("openai_oauth_token", "")
+        # Check if explicitly stored
+        stored_id = config.get("openai_chatgpt_account_id", "")
+    if stored_id:
+        return stored_id
+    if not token:
+        return ""
+    claims = _decode_jwt_payload(token)
+    account_id = ""
+    # Check organizations list
+    orgs = claims.get("organizations", [])
+    if orgs and isinstance(orgs, list):
+        if isinstance(orgs[0], dict):
+            account_id = orgs[0].get("id", "")
+        elif isinstance(orgs[0], str):
+            account_id = orgs[0]
+    # Check nested auth claim (ChatGPT JWT stores it as chatgpt_account_id)
+    if not account_id:
+        auth_claim = claims.get("https://api.openai.com/auth", {})
+        if isinstance(auth_claim, dict):
+            account_id = (auth_claim.get("chatgpt_account_id", "") or
+                          auth_claim.get("account_id", "") or
+                          auth_claim.get("organization_id", ""))
+    # Check top-level claims
+    if not account_id:
+        account_id = claims.get("account_id", "") or claims.get("org_id", "") or claims.get("sub", "")
+    # Cache it
+    if account_id:
+        with config_lock:
+            config["openai_chatgpt_account_id"] = account_id
+    return account_id
 
 
 def _using_oauth_token() -> bool:
@@ -743,8 +819,8 @@ def _using_oauth_token() -> bool:
     return has_oauth and not has_api_key
 
 
-def _call_openai_chat_completions(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float) -> str:
-    """Call OpenAI Chat Completions API."""
+def _call_openai_chat_completions(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float) -> tuple[str, dict]:
+    """Call OpenAI Chat Completions API. Returns (answer, usage_dict)."""
     if not model:
         model = "gpt-4o-mini"
     body = {"model": model, "messages": messages}
@@ -771,13 +847,20 @@ def _call_openai_chat_completions(base_url: str, bearer: str, messages: list[dic
                 pass
         raise
     result = json.loads(resp.read())
-    return result["choices"][0]["message"]["content"]
+    usage = result.get("usage", {})
+    token_usage = {
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+    return result["choices"][0]["message"]["content"], token_usage
 
 
-def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float) -> str:
-    """Call OpenAI Responses API (works with both api.openai.com and chatgpt.com backend)."""
+def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], model: str, temperature: float,
+                           is_chatgpt_backend: bool = False) -> tuple[str, dict]:
+    """Call OpenAI Responses API. Returns (answer, usage_dict)."""
     if not model:
-        model = "gpt-4o-mini"
+        model = CHATGPT_DEFAULT_MODEL if is_chatgpt_backend else "gpt-4o-mini"
     system_text = ""
     input_parts = []
     for m in messages:
@@ -787,19 +870,46 @@ def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], mod
             input_parts.append(m)
 
     body = {"model": model}
-    if system_text:
-        body["instructions"] = system_text
-    body["input"] = [{"role": m["role"], "content": m["content"]} for m in input_parts]
-    if temperature is not None:
+    # ChatGPT backend REQUIRES instructions field (even if empty)
+    body["instructions"] = system_text or "You are a helpful assistant. Antworte auf Deutsch."
+
+    if is_chatgpt_backend:
+        # ChatGPT backend needs explicit content type format
+        # User messages use "input_text", assistant messages use "output_text"
+        body["input"] = [
+            {
+                "role": m["role"],
+                "type": "message",
+                "content": [{"type": "output_text" if m["role"] == "assistant" else "input_text", "text": m["content"]}],
+            }
+            for m in input_parts
+        ]
+    else:
+        body["input"] = [{"role": m["role"], "content": m["content"]} for m in input_parts]
+
+    if temperature is not None and not is_chatgpt_backend:
         body["temperature"] = temperature
+
+    # ChatGPT backend: requires stream=true, don't store
+    if is_chatgpt_backend:
+        body["store"] = False
+        body["stream"] = True
 
     data = json.dumps(body).encode("utf-8")
     url = f"{base_url}/responses"
-    print(f"[openai] Responses API request: url={url}, model={model}, input_parts={len(input_parts)}", file=sys.stderr)
+    print(f"[openai] Responses API request: url={url}, model={model}, input_parts={len(input_parts)}, chatgpt_backend={is_chatgpt_backend}", file=sys.stderr)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {bearer}",
     }
+
+    # ChatGPT backend requires account ID header
+    if is_chatgpt_backend:
+        account_id = _get_chatgpt_account_id()
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+            print(f"[openai] Using ChatGPT-Account-ID: {account_id[:8]}...", file=sys.stderr)
+
     req = Request(url, data=data, headers=headers, method="POST")
     try:
         resp = urlopen(req, timeout=120)
@@ -811,19 +921,65 @@ def _call_openai_responses(base_url: str, bearer: str, messages: list[dict], mod
             except Exception:
                 pass
         raise
-    result = json.loads(resp.read())
-    answer = ""
-    for item in result.get("output", []):
-        if item.get("type") == "message":
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    answer += c.get("text", "")
-    if not answer:
-        answer = result.get("output_text", "") or str(result)
-    return answer
+
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    if is_chatgpt_backend:
+        # Parse SSE stream: collect text deltas from response.output_text.delta events
+        answer = ""
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload = line[6:]  # strip "data: "
+            if payload == "[DONE]":
+                break
+            try:
+                evt = json.loads(payload)
+                evt_type = evt.get("type", "")
+                if evt_type == "response.output_text.delta":
+                    answer += evt.get("delta", "")
+                elif evt_type == "response.completed":
+                    # Final event — extract usage + full text if we missed deltas
+                    resp_obj = evt.get("response", {})
+                    usage = resp_obj.get("usage", {})
+                    token_usage["prompt_tokens"] = usage.get("input_tokens", 0)
+                    token_usage["completion_tokens"] = usage.get("output_tokens", 0)
+                    token_usage["total_tokens"] = usage.get("total_tokens",
+                                                            token_usage["prompt_tokens"] + token_usage["completion_tokens"])
+                    if not answer:
+                        for item in resp_obj.get("output", []):
+                            if item.get("type") == "message":
+                                for c in item.get("content", []):
+                                    if c.get("type") == "output_text":
+                                        answer += c.get("text", "")
+                elif evt_type == "error":
+                    err_msg = evt.get("message", "") or evt.get("error", {}).get("message", "")
+                    raise ValueError(f"Stream error: {err_msg}")
+            except json.JSONDecodeError:
+                continue
+        if not answer:
+            raise ValueError("No text received from ChatGPT backend stream")
+        return answer, token_usage
+    else:
+        result = json.loads(resp.read())
+        answer = ""
+        for item in result.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        answer += c.get("text", "")
+        if not answer:
+            answer = result.get("output_text", "") or str(result)
+        usage = result.get("usage", {})
+        token_usage["prompt_tokens"] = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+        token_usage["completion_tokens"] = usage.get("output_tokens", usage.get("completion_tokens", 0))
+        token_usage["total_tokens"] = usage.get("total_tokens",
+                                                 token_usage["prompt_tokens"] + token_usage["completion_tokens"])
+        return answer, token_usage
 
 
-def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
+def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[str, float, dict]:
     with config_lock:
         base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
 
@@ -834,13 +990,14 @@ def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[s
     use_oauth = _using_oauth_token()
 
     start = time.time()
+    token_usage = {}
 
     if use_oauth:
         # OAuth token (ChatGPT login): must use chatgpt.com backend, NOT api.openai.com
-        # The raw OAuth access_token is only valid for the ChatGPT backend API
-        print(f"[openai] Using ChatGPT backend (OAuth token)", file=sys.stderr)
+        print(f"[openai] Using ChatGPT backend (OAuth token), model={model}", file=sys.stderr)
         try:
-            answer = _call_openai_responses(CHATGPT_BACKEND_URL, bearer, messages, model, temperature)
+            answer, token_usage = _call_openai_responses(CHATGPT_BACKEND_URL, bearer, messages, model, temperature,
+                                                         is_chatgpt_backend=True)
         except Exception as e1:
             print(f"[openai] ChatGPT backend failed: {e1}", file=sys.stderr)
             if "429" in str(e1):
@@ -848,13 +1005,13 @@ def call_openai(messages: list[dict], model: str, temperature: float) -> tuple[s
             raise ValueError(f"OpenAI API call failed. Error: {e1}")
     else:
         # API key: use standard api.openai.com with Chat Completions
-        answer = _call_openai_chat_completions(base_url, bearer, messages, model, temperature)
+        answer, token_usage = _call_openai_chat_completions(base_url, bearer, messages, model, temperature)
 
     duration_ms = (time.time() - start) * 1000
-    return answer, round(duration_ms, 1)
+    return answer, round(duration_ms, 1), token_usage
 
 
-def call_anthropic(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
+def call_anthropic(messages: list[dict], model: str, temperature: float) -> tuple[str, float, dict]:
     with config_lock:
         api_key = config["anthropic_api_key"]
 
@@ -894,11 +1051,17 @@ def call_anthropic(messages: list[dict], model: str, temperature: float) -> tupl
     resp = urlopen(req, timeout=120)
     result = json.loads(resp.read())
     answer = result["content"][0]["text"]
+    usage = result.get("usage", {})
+    token_usage = {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+    }
     duration_ms = (time.time() - start) * 1000
-    return answer, round(duration_ms, 1)
+    return answer, round(duration_ms, 1), token_usage
 
 
-def call_openrouter(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
+def call_openrouter(messages: list[dict], model: str, temperature: float) -> tuple[str, float, dict]:
     with config_lock:
         api_key = config["openrouter_api_key"]
 
@@ -924,12 +1087,18 @@ def call_openrouter(messages: list[dict], model: str, temperature: float) -> tup
     resp = urlopen(req, timeout=120)
     result = json.loads(resp.read())
     answer = result["choices"][0]["message"]["content"]
+    usage = result.get("usage", {})
+    token_usage = {
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
     duration_ms = (time.time() - start) * 1000
-    return answer, round(duration_ms, 1)
+    return answer, round(duration_ms, 1), token_usage
 
 
-def call_llm(messages: list[dict], model: str, temperature: float) -> tuple[str, float]:
-    """Dispatch to the configured LLM provider."""
+def call_llm(messages: list[dict], model: str, temperature: float) -> tuple[str, float, dict]:
+    """Dispatch to the configured LLM provider. Returns (answer, duration_ms, token_usage)."""
     with config_lock:
         provider = config.get("provider", "ollama")
     if provider == "openai":
@@ -940,6 +1109,686 @@ def call_llm(messages: list[dict], model: str, temperature: float) -> tuple[str,
         return call_openrouter(messages, model, temperature)
     else:
         return call_ollama(messages, model, temperature)
+
+
+# ---------------------------------------------------------------------------
+# Token usage tracking
+# ---------------------------------------------------------------------------
+_token_usage_lock = threading.Lock()
+_token_usage: dict = {
+    "session_total": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests": 0},
+    "by_user": {},  # username -> {prompt_tokens, completion_tokens, total_tokens, requests}
+}
+
+
+def track_token_usage(username: str, usage: dict):
+    """Accumulate token usage for a user and the session total."""
+    if not usage or not usage.get("total_tokens"):
+        return
+    with _token_usage_lock:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            _token_usage["session_total"][key] += usage.get(key, 0)
+        _token_usage["session_total"]["requests"] += 1
+        if username not in _token_usage["by_user"]:
+            _token_usage["by_user"][username] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests": 0}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            _token_usage["by_user"][username][key] += usage.get(key, 0)
+        _token_usage["by_user"][username]["requests"] += 1
+
+
+def get_token_usage(username: str = None) -> dict:
+    """Get token usage stats. If username given, include user-specific stats."""
+    with _token_usage_lock:
+        result = {"session_total": dict(_token_usage["session_total"])}
+        if username and username in _token_usage["by_user"]:
+            result["user"] = dict(_token_usage["by_user"][username])
+        else:
+            result["user"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests": 0}
+        result["all_users"] = {k: dict(v) for k, v in _token_usage["by_user"].items()}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Agent Mode — tool registry, handlers, and loop
+# ---------------------------------------------------------------------------
+AGENT_TOOLS = [
+    {
+        "name": "query_database",
+        "description": "Execute a read-only SQL query against the configured database. Use this when you need to look up data, records, or statistics.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "The SQL SELECT query to execute"}
+            },
+            "required": ["sql"]
+        },
+        "privileged": True,
+        "requires": "db_enabled"
+    },
+    {
+        "name": "search_knowledge",
+        "description": "Search the knowledge base (RAG) for relevant information. Use this for company-specific or uploaded document questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query"}
+            },
+            "required": ["query"]
+        },
+        "privileged": True,
+        "requires": "rag_enabled"
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web using DuckDuckGo. Use for current events, general knowledge, or anything not in the database/knowledge base.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query"}
+            },
+            "required": ["query"]
+        },
+        "privileged": False,
+        "requires": "agent_web_search"
+    },
+    {
+        "name": "calculate",
+        "description": "Evaluate a mathematical expression safely. Supports +, -, *, /, **, %, sqrt, abs, round, min, max, sum.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Math expression, e.g. '(100 * 1.19) + 50'"}
+            },
+            "required": ["expression"]
+        },
+        "privileged": False,
+        "requires": None
+    },
+    {
+        "name": "get_datetime",
+        "description": "Get the current date and time.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        },
+        "privileged": False,
+        "requires": None
+    },
+    {
+        "name": "list_tables",
+        "description": "List all tables and their columns in the connected database.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        },
+        "privileged": True,
+        "requires": "db_enabled"
+    }
+]
+
+
+def _get_available_tools(role: str) -> list:
+    """Filter AGENT_TOOLS based on user role and enabled features."""
+    with config_lock:
+        cfg_snapshot = dict(config)
+    tools = []
+    for t in AGENT_TOOLS:
+        # Check if required feature is enabled
+        req = t.get("requires")
+        if req and not cfg_snapshot.get(req, False):
+            continue
+        # Check privilege: only admin/mitarbeiter get privileged tools
+        if t.get("privileged") and role not in ("admin", "mitarbeiter"):
+            continue
+        tools.append(t)
+    return tools
+
+
+def _execute_tool(name: str, arguments: dict) -> str:
+    """Execute a tool by name and return the result as a string."""
+    try:
+        if name == "query_database":
+            sql = arguments.get("sql", "")
+            result = execute_db_query(sql)
+            if result.get("error"):
+                return f"Error: {result['error']}"
+            cols = result.get("columns", [])
+            rows = result.get("rows", [])
+            if not rows:
+                return "Query returned 0 rows."
+            # Format as markdown table
+            header = " | ".join(cols)
+            sep = " | ".join("---" for _ in cols)
+            data = "\n".join(" | ".join(str(r.get(c, "")) for c in cols) for r in rows[:50])
+            return f"{result['row_count']} rows returned:\n\n{header}\n{sep}\n{data}"
+
+        elif name == "search_knowledge":
+            query = arguments.get("query", "")
+            chunks = search_embeddings(query)
+            if not chunks:
+                return "No relevant results found in the knowledge base."
+            parts = []
+            for i, c in enumerate(chunks, 1):
+                parts.append(f"{i}. [Score: {c['similarity']}] {c['content'][:500]}")
+            return "\n\n".join(parts)
+
+        elif name == "web_search":
+            query = arguments.get("query", "")
+            return _web_search_ddg(query)
+
+        elif name == "calculate":
+            expr = arguments.get("expression", "")
+            return _safe_math_eval(expr)
+
+        elif name == "get_datetime":
+            now = datetime.now()
+            return now.strftime("%A, %d. %B %Y, %H:%M:%S Uhr")
+
+        elif name == "list_tables":
+            schema = get_db_schema()
+            return schema if schema else "No database schema available."
+
+        else:
+            return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Tool error ({name}): {e}"
+
+
+def _web_search_ddg(query: str, max_results: int = 5) -> str:
+    """Search DuckDuckGo HTML and extract results."""
+    try:
+        from urllib.parse import quote_plus
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        resp = urlopen(req, timeout=10)
+        html = resp.read().decode("utf-8", errors="replace")
+
+        # Parse results
+        results = []
+        # Find result links
+        link_pattern = re.compile(
+            r'<a\s+rel="nofollow"\s+class="result__a"\s+href="([^"]+)"[^>]*>(.*?)</a>',
+            re.DOTALL
+        )
+        snippet_pattern = re.compile(
+            r'<a\s+class="result__snippet"[^>]*>(.*?)</a>',
+            re.DOTALL
+        )
+
+        links = link_pattern.findall(html)
+        snippets = snippet_pattern.findall(html)
+
+        for i in range(min(len(links), max_results)):
+            href, title = links[i]
+            title = re.sub(r'<[^>]+>', '', title).strip()
+            snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip() if i < len(snippets) else ""
+            if title:
+                results.append(f"{i+1}. [{title}]({href})\n   {snippet}")
+
+        if not results:
+            return f"No web results found for: {query}"
+        return "\n\n".join(results)
+    except Exception as e:
+        return f"Web search error: {e}"
+
+
+def _safe_math_eval(expr: str) -> str:
+    """Safely evaluate a math expression using AST parsing."""
+    # Replace common German/locale decimal comma: "2.499,99" -> "2499.99"
+    # But only do simple comma->dot replacement for single numbers like "2499,99"
+    expr = re.sub(r'(\d),(\d)', r'\1.\2', expr)
+
+    allowed_names = {
+        "sqrt": math.sqrt, "abs": abs, "round": round,
+        "min": min, "max": max, "sum": sum, "pow": pow,
+        "int": int, "float": float, "pi": math.pi, "e": math.e,
+    }
+
+    try:
+        tree = ast.parse(expr, mode='eval')
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+
+    # Validate AST nodes
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                             ast.Call, ast.Name, ast.Load, ast.Add, ast.Sub,
+                             ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv,
+                             ast.USub, ast.UAdd, ast.List, ast.Tuple)):
+            continue
+        # Allow Num for older Python versions
+        if hasattr(ast, 'Num') and isinstance(node, ast.Num):
+            continue
+        if isinstance(node, ast.Name):
+            if node.id not in allowed_names:
+                return f"Not allowed: {node.id}"
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in allowed_names:
+                continue
+            return f"Function not allowed"
+        elif isinstance(node, ast.Attribute):
+            return "Attribute access not allowed"
+
+    # Check all Name references are allowed
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            return f"Unknown variable: {node.id}"
+
+    try:
+        result = eval(compile(tree, "<math>", "eval"), {"__builtins__": {}}, allowed_names)
+        # Format nicely
+        if isinstance(result, float):
+            if result == int(result) and abs(result) < 1e15:
+                return str(int(result))
+            return f"{result:.6g}"
+        return str(result)
+    except Exception as e:
+        return f"Calculation error: {e}"
+
+
+# --- Provider-specific tool format converters ---
+
+def _tools_to_openai_format(tools: list) -> list:
+    """Convert AGENT_TOOLS to OpenAI function calling format."""
+    return [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}} for t in tools]
+
+
+def _tools_to_anthropic_format(tools: list) -> list:
+    """Convert AGENT_TOOLS to Anthropic tool use format."""
+    return [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in tools]
+
+
+def _supports_native_tools() -> bool:
+    """Check if current provider+config supports native function calling."""
+    with config_lock:
+        provider = config.get("provider", "ollama")
+    if provider == "anthropic":
+        return True
+    if provider == "openai":
+        with config_lock:
+            return bool(config.get("openai_api_key"))
+    if provider == "openrouter":
+        return True
+    if provider == "ollama":
+        return True
+    return False
+
+
+# --- Provider-specific LLM+tools callers ---
+
+def _call_ollama_with_tools(messages: list, model: str, temperature: float, tools: list) -> tuple:
+    """Call Ollama with tool support. Returns (text_or_none, tool_calls_or_none, usage)."""
+    with config_lock:
+        ollama_url = config["ollama_url"]
+
+    body = {"model": model, "messages": messages, "stream": False,
+            "tools": _tools_to_openai_format(tools)}
+    if temperature is not None:
+        body["options"] = {"temperature": temperature}
+
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        f"{ollama_url}/api/chat", data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    usage = {
+        "prompt_tokens": result.get("prompt_eval_count", 0),
+        "completion_tokens": result.get("eval_count", 0),
+        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_count", 0),
+    }
+
+    msg = result.get("message", {})
+    tool_calls_raw = msg.get("tool_calls")
+    if tool_calls_raw:
+        parsed = []
+        for tc in tool_calls_raw:
+            fn = tc.get("function", {})
+            parsed.append({"name": fn.get("name", ""), "arguments": fn.get("arguments", {})})
+        return None, parsed, usage
+    return msg.get("content", ""), None, usage
+
+
+def _call_openai_with_tools(messages: list, model: str, temperature: float, tools: list) -> tuple:
+    """Call OpenAI Chat Completions with tool support. Returns (text_or_none, tool_calls_or_none, usage)."""
+    with config_lock:
+        base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+    bearer = get_openai_bearer_token()
+    if not bearer:
+        raise ValueError("OpenAI API key not configured")
+
+    body = {"model": model or "gpt-4o-mini", "messages": messages,
+            "tools": _tools_to_openai_format(tools)}
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        f"{base_url}/chat/completions", data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"},
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    usage_raw = result.get("usage", {})
+    usage = {
+        "prompt_tokens": usage_raw.get("prompt_tokens", 0),
+        "completion_tokens": usage_raw.get("completion_tokens", 0),
+        "total_tokens": usage_raw.get("total_tokens", 0),
+    }
+
+    choice = result["choices"][0]["message"]
+    tool_calls_raw = choice.get("tool_calls")
+    if tool_calls_raw:
+        parsed = []
+        for tc in tool_calls_raw:
+            fn = tc.get("function", {})
+            args = fn.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            parsed.append({"name": fn.get("name", ""), "arguments": args, "id": tc.get("id", "")})
+        return None, parsed, usage
+    return choice.get("content", ""), None, usage
+
+
+def _call_anthropic_with_tools(messages: list, model: str, temperature: float, tools: list) -> tuple:
+    """Call Anthropic with tool support. Returns (text_or_none, tool_calls_or_none, usage)."""
+    with config_lock:
+        api_key = config["anthropic_api_key"]
+    if not api_key:
+        raise ValueError("Anthropic API key not configured")
+
+    system_prompt = ""
+    chat_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_prompt += m["content"] + "\n"
+        else:
+            chat_messages.append(m)
+
+    body = {
+        "model": model, "max_tokens": 4096,
+        "messages": chat_messages,
+        "tools": _tools_to_anthropic_format(tools),
+    }
+    if system_prompt:
+        body["system"] = system_prompt.strip()
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        "https://api.anthropic.com/v1/messages", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    usage_raw = result.get("usage", {})
+    usage = {
+        "prompt_tokens": usage_raw.get("input_tokens", 0),
+        "completion_tokens": usage_raw.get("output_tokens", 0),
+        "total_tokens": usage_raw.get("input_tokens", 0) + usage_raw.get("output_tokens", 0),
+    }
+
+    # Anthropic returns content blocks
+    text_parts = []
+    tool_calls = []
+    for block in result.get("content", []):
+        if block["type"] == "text":
+            text_parts.append(block["text"])
+        elif block["type"] == "tool_use":
+            tool_calls.append({
+                "name": block["name"],
+                "arguments": block.get("input", {}),
+                "id": block.get("id", ""),
+            })
+
+    if tool_calls:
+        return " ".join(text_parts) if text_parts else None, tool_calls, usage
+    return " ".join(text_parts) if text_parts else "", None, usage
+
+
+def _call_openrouter_with_tools(messages: list, model: str, temperature: float, tools: list) -> tuple:
+    """Call OpenRouter with tool support. Returns (text_or_none, tool_calls_or_none, usage)."""
+    with config_lock:
+        api_key = config["openrouter_api_key"]
+    if not api_key:
+        raise ValueError("OpenRouter API key not configured")
+
+    body = {"model": model, "messages": messages,
+            "tools": _tools_to_openai_format(tools)}
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "http://localhost:7779",
+            "X-Title": "WaWi Chatbot Monitor",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    result = json.loads(resp.read())
+    usage_raw = result.get("usage", {})
+    usage = {
+        "prompt_tokens": usage_raw.get("prompt_tokens", 0),
+        "completion_tokens": usage_raw.get("completion_tokens", 0),
+        "total_tokens": usage_raw.get("total_tokens", 0),
+    }
+
+    choice = result["choices"][0]["message"]
+    tool_calls_raw = choice.get("tool_calls")
+    if tool_calls_raw:
+        parsed = []
+        for tc in tool_calls_raw:
+            fn = tc.get("function", {})
+            args = fn.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            parsed.append({"name": fn.get("name", ""), "arguments": args, "id": tc.get("id", "")})
+        return None, parsed, usage
+    return choice.get("content", ""), None, usage
+
+
+def _call_with_text_fallback(messages: list, model: str, temperature: float, tools: list) -> tuple:
+    """Text-based tool calling fallback for providers without native tool support."""
+    # Build tool description text
+    tool_desc_parts = ["You have access to the following tools:\n"]
+    for t in tools:
+        params_desc = ""
+        props = t["parameters"].get("properties", {})
+        if props:
+            param_strs = []
+            for pname, pinfo in props.items():
+                param_strs.append(f'  - {pname}: {pinfo.get("description", "")}')
+            params_desc = "\n".join(param_strs)
+        tool_desc_parts.append(f"**{t['name']}**: {t['description']}")
+        if params_desc:
+            tool_desc_parts.append(f"  Parameters:\n{params_desc}")
+
+    tool_desc_parts.append(
+        '\nTo use a tool, respond with:\n<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>\n'
+        "You may use multiple tool calls in one response. After tool results are provided, continue reasoning."
+    )
+    tool_instruction = "\n".join(tool_desc_parts)
+
+    # Inject into system message
+    augmented = []
+    system_injected = False
+    for m in messages:
+        if m["role"] == "system" and not system_injected:
+            augmented.append({"role": "system", "content": m["content"] + "\n\n" + tool_instruction})
+            system_injected = True
+        else:
+            augmented.append(m)
+    if not system_injected:
+        augmented.insert(0, {"role": "system", "content": tool_instruction})
+
+    answer, duration_ms, usage = call_llm(augmented, model, temperature)
+
+    # Parse <tool_call> blocks
+    tc_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
+    matches = tc_pattern.findall(answer)
+    if matches:
+        parsed = []
+        for m in matches:
+            try:
+                obj = json.loads(m.strip())
+                parsed.append({"name": obj.get("name", ""), "arguments": obj.get("arguments", {})})
+            except json.JSONDecodeError:
+                continue
+        # Strip tool calls from text
+        clean_text = tc_pattern.sub("", answer).strip()
+        if parsed:
+            return clean_text if clean_text else None, parsed, usage
+    return answer, None, usage
+
+
+# --- Core agent loop ---
+
+def run_agent_loop(messages: list, model: str, temperature: float,
+                   available_tools: list, max_steps: int = 8) -> tuple:
+    """Run the agent loop. Returns (final_answer, tool_log, total_usage)."""
+    tool_log = []
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    use_native = _supports_native_tools()
+
+    with config_lock:
+        provider = config.get("provider", "ollama")
+
+    # Working copy of messages
+    working_messages = list(messages)
+
+    for step in range(max_steps):
+        print(f"[agent] Step {step+1}/{max_steps}, provider={provider}, native={use_native}", file=sys.stderr)
+
+        try:
+            if use_native:
+                if provider == "ollama":
+                    text, tool_calls, usage = _call_ollama_with_tools(working_messages, model, temperature, available_tools)
+                elif provider == "openai":
+                    text, tool_calls, usage = _call_openai_with_tools(working_messages, model, temperature, available_tools)
+                elif provider == "anthropic":
+                    text, tool_calls, usage = _call_anthropic_with_tools(working_messages, model, temperature, available_tools)
+                elif provider == "openrouter":
+                    text, tool_calls, usage = _call_openrouter_with_tools(working_messages, model, temperature, available_tools)
+                else:
+                    text, tool_calls, usage = _call_with_text_fallback(working_messages, model, temperature, available_tools)
+            else:
+                text, tool_calls, usage = _call_with_text_fallback(working_messages, model, temperature, available_tools)
+        except Exception as e:
+            print(f"[agent] LLM call error at step {step+1}: {e}", file=sys.stderr)
+            return f"Agent error: {e}", tool_log, total_usage
+
+        # Accumulate usage
+        for k in total_usage:
+            total_usage[k] += usage.get(k, 0)
+
+        # No tool calls — LLM is done
+        if not tool_calls:
+            final = text or ""
+            if step == 0 and not final:
+                final = "(No response from model)"
+            return final, tool_log, total_usage
+
+        # Execute tool calls and build follow-up messages
+        if use_native and provider == "anthropic":
+            # Anthropic: assistant message has content blocks, tool results go as user message
+            assistant_content = []
+            if text:
+                assistant_content.append({"type": "text", "text": text})
+            for tc in tool_calls:
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": tc.get("id", f"tool_{step}_{tc['name']}"),
+                    "name": tc["name"],
+                    "input": tc["arguments"],
+                })
+            working_messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_results_content = []
+            for tc in tool_calls:
+                result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
+                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                tool_results_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.get("id", f"tool_{step}_{tc['name']}"),
+                    "content": result_str,
+                })
+            working_messages.append({"role": "user", "content": tool_results_content})
+
+        elif use_native and provider in ("openai", "openrouter"):
+            # OpenAI/OpenRouter: assistant message with tool_calls, then tool role messages
+            assistant_msg = {"role": "assistant", "content": text or ""}
+            assistant_msg["tool_calls"] = []
+            for i, tc in enumerate(tool_calls):
+                call_id = tc.get("id", f"call_{step}_{i}")
+                assistant_msg["tool_calls"].append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
+                })
+            working_messages.append(assistant_msg)
+
+            for i, tc in enumerate(tool_calls):
+                call_id = tc.get("id", f"call_{step}_{i}")
+                result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
+                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result_str})
+
+        elif use_native and provider == "ollama":
+            # Ollama: similar to OpenAI format
+            assistant_msg = {"role": "assistant", "content": text or ""}
+            assistant_msg["tool_calls"] = []
+            for i, tc in enumerate(tool_calls):
+                assistant_msg["tool_calls"].append({
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                })
+            working_messages.append(assistant_msg)
+
+            for tc in tool_calls:
+                result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
+                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                working_messages.append({"role": "tool", "content": result_str})
+
+        else:
+            # Text fallback: append results as user message
+            if text:
+                working_messages.append({"role": "assistant", "content": text})
+            parts = []
+            for tc in tool_calls:
+                result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
+                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                parts.append(f'<tool_result name="{tc["name"]}">{result_str}</tool_result>')
+            working_messages.append({"role": "user", "content": "\n".join(parts)})
+
+    # Max steps reached
+    last_text = text or ""
+    if tool_log:
+        last_text += "\n\n(Agent reached maximum step limit)"
+    return last_text, tool_log, total_usage
 
 
 OPENAI_MODELS = [
@@ -978,6 +1827,25 @@ def list_models() -> list[dict]:
         if use_oauth:
             # OAuth: fetch models from ChatGPT backend
             models_url = f"{CHATGPT_BACKEND_URL}/models"
+            headers = {"Authorization": f"Bearer {bearer}"}
+            account_id = _get_chatgpt_account_id()
+            if account_id:
+                headers["ChatGPT-Account-ID"] = account_id
+            try:
+                req = Request(models_url, method="GET", headers=headers)
+                resp = urlopen(req, timeout=5)
+                data = json.loads(resp.read())
+                models = data.get("data", [])
+                chat_models = [
+                    {"name": m["id"], "size": 0}
+                    for m in models
+                    if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "o4", "chatgpt-"))
+                ]
+                if chat_models:
+                    return sorted(chat_models, key=lambda x: x["name"])
+            except Exception as e:
+                print(f"[openai] ChatGPT model list failed: {e}", file=sys.stderr)
+            return CHATGPT_CODEX_MODELS
         else:
             with config_lock:
                 base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
@@ -2251,16 +3119,44 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                         except Exception:
                             pass
 
+            # Extract account ID from access_token JWT for ChatGPT backend API calls
+            account_id = ""
+            claims = _decode_jwt_payload(access_token)
+            orgs = claims.get("organizations", [])
+            if orgs and isinstance(orgs, list):
+                if isinstance(orgs[0], dict):
+                    account_id = orgs[0].get("id", "")
+                elif isinstance(orgs[0], str):
+                    account_id = orgs[0]
+            if not account_id:
+                account_id = claims.get("account_id", "") or claims.get("org_id", "")
+            print(f"[oauth] JWT claims keys: {list(claims.keys())}", file=sys.stderr)
+            # Log the auth claim for debugging account_id extraction
+            auth_claim = claims.get("https://api.openai.com/auth", {})
+            profile_claim = claims.get("https://api.openai.com/profile", {})
+            print(f"[oauth] auth claim: {json.dumps(auth_claim) if isinstance(auth_claim, dict) else auth_claim}", file=sys.stderr)
+            print(f"[oauth] profile claim: {json.dumps(profile_claim) if isinstance(profile_claim, dict) else profile_claim}", file=sys.stderr)
+            # Try to get account_id from auth claim
+            if not account_id and isinstance(auth_claim, dict):
+                account_id = (auth_claim.get("chatgpt_account_id", "") or
+                              auth_claim.get("account_id", "") or
+                              auth_claim.get("organization_id", ""))
+            if account_id:
+                print(f"[oauth] Extracted account_id: {account_id[:8]}...", file=sys.stderr)
+            else:
+                print(f"[oauth] WARNING: No account_id found in JWT claims", file=sys.stderr)
+
             with config_lock:
                 config["openai_oauth_token"] = access_token
                 config["openai_refresh_token"] = refresh_token
                 config["openai_token_expires"] = time.time() + expires_in - 60
+                config["openai_chatgpt_account_id"] = account_id
                 if api_key:
                     config["openai_api_key"] = api_key
                 config["provider"] = "openai"
             save_config()
 
-            self._send_json({"ok": True, "provider": "openai", "has_api_key": bool(api_key)})
+            self._send_json({"ok": True, "provider": "openai", "has_api_key": bool(api_key), "has_account_id": bool(account_id)})
         except Exception as e:
             self._send_json({"error": f"OpenAI token exchange failed: {e}"}, 502)
 
@@ -2392,8 +3288,72 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         messages.extend(get_chat_history(sid))
 
         total_start = time.time()
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        tool_log = []
+
+        # --- Agent mode ---
+        with config_lock:
+            agent_enabled = config.get("agent_enabled", False)
+            agent_max_steps = config.get("agent_max_steps", 8)
+
+        if agent_enabled:
+            available_tools = _get_available_tools(user_role)
+            if available_tools:
+                # Add agent instruction to system prompt
+                agent_sys = (
+                    "You are an agent with access to tools. Use them when needed to answer questions accurately. "
+                    "Always prefer using tools over guessing. If a tool call fails, try a different approach."
+                )
+                if messages and messages[0]["role"] == "system":
+                    messages[0]["content"] += "\n\n" + agent_sys
+                else:
+                    messages.insert(0, {"role": "system", "content": agent_sys})
+
+                try:
+                    answer, tool_log, agent_usage = run_agent_loop(
+                        messages, model, temperature, available_tools,
+                        max_steps=agent_max_steps
+                    )
+                    for k in total_usage:
+                        total_usage[k] += agent_usage.get(k, 0)
+                except Exception as e:
+                    ingest_event({
+                        "type": "error", "message": str(e),
+                        "error_type": "agent_error", "user_id": user_id,
+                    })
+                    self._send_json({"error": str(e)}, 502)
+                    return
+
+                total_ms = round((time.time() - total_start) * 1000, 1)
+                track_token_usage(user_id, total_usage)
+                append_chat_message(sid, "assistant", answer, username=user_id, model=model)
+
+                evt_data = {
+                    "type": "chat", "user_id": user_id, "question": question,
+                    "answer": answer, "duration_ms": total_ms, "model": model,
+                }
+                if total_usage.get("total_tokens"):
+                    evt_data["token_usage"] = total_usage
+                if tool_log:
+                    evt_data["tool_log"] = tool_log
+                evt = ingest_event(evt_data)
+
+                resp = {
+                    "ok": True, "id": evt["id"], "answer": answer,
+                    "duration_ms": total_ms, "model": model,
+                }
+                if total_usage.get("total_tokens"):
+                    resp["token_usage"] = total_usage
+                if tool_log:
+                    resp["tool_log"] = tool_log
+                self._send_json(resp)
+                return
+
+        # --- Standard (non-agent) path ---
         try:
-            answer, duration_ms = call_llm(messages, model, temperature)
+            answer, duration_ms, token_usage = call_llm(messages, model, temperature)
+            for k in total_usage:
+                total_usage[k] += token_usage.get(k, 0)
         except Exception as e:
             ingest_event({
                 "type": "error", "message": str(e),
@@ -2418,8 +3378,10 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     messages.append({"role": "assistant", "content": answer})
                     messages.append({"role": "user", "content": error_msg})
                     try:
-                        answer, extra_ms = call_llm(messages, model, temperature)
+                        answer, extra_ms, extra_usage = call_llm(messages, model, temperature)
                         duration_ms += extra_ms
+                        for k in total_usage:
+                            total_usage[k] += extra_usage.get(k, 0)
                     except Exception:
                         pass
                     sql_executed = {"sql": sql_code, "error": query_result["error"]}
@@ -2441,14 +3403,19 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     messages.append({"role": "assistant", "content": answer})
                     messages.append({"role": "user", "content": result_text})
                     try:
-                        answer, extra_ms = call_llm(messages, model, temperature)
+                        answer, extra_ms, extra_usage = call_llm(messages, model, temperature)
                         duration_ms += extra_ms
+                        for k in total_usage:
+                            total_usage[k] += extra_usage.get(k, 0)
                     except Exception:
                         pass
                     sql_executed = {"sql": sql_code, "row_count": query_result["row_count"],
                                     "duration_ms": query_result["duration_ms"]}
 
         total_ms = round((time.time() - total_start) * 1000, 1)
+
+        # Track token usage
+        track_token_usage(user_id, total_usage)
 
         # Append assistant response to session history
         append_chat_message(sid, "assistant", answer, username=user_id, model=model)
@@ -2457,6 +3424,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             "type": "chat", "user_id": user_id, "question": question,
             "answer": answer, "duration_ms": total_ms, "model": model,
         }
+        if total_usage.get("total_tokens"):
+            evt_data["token_usage"] = total_usage
         if sql_executed:
             evt_data["sql_executed"] = sql_executed
         evt = ingest_event(evt_data)
@@ -2465,6 +3434,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             "ok": True, "id": evt["id"], "answer": answer,
             "duration_ms": total_ms, "model": model,
         }
+        if total_usage.get("total_tokens"):
+            resp["token_usage"] = total_usage
         if sql_executed:
             resp["sql_executed"] = sql_executed
         self._send_json(resp)
@@ -2515,6 +3486,13 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             for key in ("embedding_provider", "embedding_model"):
                 if key in data:
                     config[key] = data[key]
+            # Agent config keys
+            if "agent_enabled" in data:
+                config["agent_enabled"] = bool(data["agent_enabled"])
+            if "agent_web_search" in data:
+                config["agent_web_search"] = bool(data["agent_web_search"])
+            if "agent_max_steps" in data:
+                config["agent_max_steps"] = max(1, min(20, int(data["agent_max_steps"])))
         # Refresh schema cache if DB config changed
         if db_config_changed:
             with config_lock:
@@ -2728,6 +3706,17 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self._handle_models()
+
+        if path == "/api/usage":
+            session = self._require_auth("user")
+            if not session:
+                return
+            username = session["username"]
+            usage = get_token_usage(username)
+            # Only admins see all_users breakdown
+            if session["role"] != "admin":
+                usage.pop("all_users", None)
+            return self._send_json(usage)
 
         # Admin-level endpoints
         if path == "/api/events":

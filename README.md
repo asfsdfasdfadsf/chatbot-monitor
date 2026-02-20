@@ -24,6 +24,7 @@ Everything runs on localhost — zero config, zero external dependencies for the
 ## Features
 
 - **Multi-provider LLM** — switch between Ollama (local), OpenAI (ChatGPT), Anthropic (Claude), and OpenRouter (200+ models via OAuth)
+- **Agent Mode** — LLM autonomously calls tools (DB queries, RAG search, web search, calculator, datetime, schema listing) in a loop until it has enough info to answer
 - **OpenAI OAuth PKCE** — login with your ChatGPT account (Plus/Pro) instead of API keys
 - **Chat memory** — session-based conversation history (max 20 messages per session)
 - **Chat file upload** — attach .txt, .md, .csv, .json, .xlsx files directly in chat for analysis
@@ -270,6 +271,57 @@ The Knowledge tab (right panel) shows:
 - Search test to verify RAG retrieval
 - Stats (total documents, chunks, DB size)
 
+## Agent Mode
+
+When enabled, the LLM can autonomously call tools in a loop (up to N steps) to gather information before answering. This replaces the simple NL-to-SQL two-pass approach with a proper tool-calling agent.
+
+### Available Tools
+
+| Tool | Description | Privilege | Requires |
+|------|-------------|-----------|----------|
+| `query_database` | Execute read-only SQL SELECT queries | Admin/Mitarbeiter | DB enabled |
+| `search_knowledge` | Search the RAG knowledge base | Admin/Mitarbeiter | RAG enabled |
+| `web_search` | Search the web via DuckDuckGo | All users | Web Search enabled |
+| `calculate` | Safe math expression evaluator | All users | Always available |
+| `get_datetime` | Get current date and time | All users | Always available |
+| `list_tables` | List database tables and columns | Admin/Mitarbeiter | DB enabled |
+
+### How It Works
+
+```
+User question → Agent loop (up to max_steps):
+  → LLM decides which tool(s) to call
+  → Server executes tool, returns result
+  → LLM reasons about results, calls more tools or produces final answer
+→ Final answer displayed with collapsible tool log
+```
+
+The agent supports **native function calling** for providers that support it (OpenAI API key, Anthropic, Ollama, OpenRouter) and falls back to **text-based tool calling** (XML `<tool_call>` parsing) for providers without native support (e.g. ChatGPT OAuth backend).
+
+### Setup
+
+1. Go to **Settings** → **Agent Mode** section
+2. Check **Enable Agent Mode**
+3. Set **Max Steps** (default: 8, max: 20)
+4. Optionally enable/disable **Web Search**
+5. Save
+
+### DSGVO / Permission Model
+
+- **Admin/Mitarbeiter**: Access to all tools including database and knowledge base
+- **Regular users**: Only non-privileged tools (calculator, datetime, web search)
+- Tools are filtered based on the user's role and which features are enabled in config
+
+### Tool Log in Chat
+
+When agent mode is used, bot messages display:
+- A purple **Agent** badge next to "Bot"
+- A collapsible **"Tools used"** section showing each tool call with input/output, color-coded by tool type
+
+### Fallback
+
+When agent mode is OFF, the existing NL-to-SQL two-pass approach still works as before. Agent mode is a strict superset — it can do everything the old approach did, plus more.
+
 ## Chat Features
 
 ### Memory
@@ -505,6 +557,9 @@ Default: everything on localhost, zero config needed.
 | RAG enabled | `false` | Dashboard settings |
 | RAG top-K | `5` | Dashboard settings |
 | Embedding provider | `auto` | Dashboard settings (`"auto"`, `"openai"`, `"ollama"`) |
+| Agent mode | `false` | Dashboard settings |
+| Agent max steps | `8` | Dashboard settings (1–20) |
+| Agent web search | `true` | Dashboard settings |
 | Max events | 5000 | `MAX_EVENTS` in `server.py` |
 | Session TTL | 24 hours | `SESSION_TTL` in `server.py` |
 

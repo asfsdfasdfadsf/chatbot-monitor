@@ -196,6 +196,37 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .role-badge.mitarbeiter { background:rgba(57,210,192,0.15); color:var(--cyan); }
 .role-badge.user { background:rgba(88,166,255,0.15); color:var(--accent); }
 .user-header-info { display:flex; align-items:center; gap:6px; margin-left:8px; }
+
+/* Token usage meter */
+.usage-bar { display:none; padding:6px 12px; background:var(--surface); border-top:1px solid var(--border); font-size:11px; color:var(--text-dim); }
+.usage-bar.visible { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.usage-bar .ub-item { display:flex; align-items:center; gap:4px; }
+.usage-bar .ub-label { color:var(--text-dim); }
+.usage-bar .ub-val { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+.usage-bar .ub-val.accent { color:var(--accent); }
+.usage-bar .ub-sep { width:1px; height:14px; background:var(--border); }
+.usage-bar .ub-msg { display:flex; align-items:center; gap:3px; }
+.usage-bar .ub-dot { width:6px; height:6px; border-radius:50%; }
+.usage-bar .ub-dot.in { background:var(--cyan); }
+.usage-bar .ub-dot.out { background:var(--green); }
+
+/* Tool log in chat bubbles */
+.tool-log { margin-top:8px; border-top:1px solid var(--border); padding-top:6px; }
+.tool-log-header { cursor:pointer; font-size:11px; color:var(--text-dim); display:flex; align-items:center; gap:4px; user-select:none; }
+.tool-log-header:hover { color:var(--text); }
+.tool-log .toggle-arrow { font-size:9px; transition:transform .2s; }
+.tool-log.open .toggle-arrow { transform:rotate(90deg); }
+.tool-log-body { display:none; margin-top:6px; }
+.tool-log.open .tool-log-body { display:block; }
+.tool-step { margin-bottom:6px; padding:4px 8px; background:var(--surface); border:1px solid var(--border); border-radius:6px; font-size:11px; }
+.tool-step .tool-name { font-weight:600; padding:1px 6px; border-radius:4px; font-size:10px; }
+.tool-name.tn-query_database, .tool-name.tn-list_tables { background:#1a2332; color:var(--accent); }
+.tool-name.tn-search_knowledge { background:#1f1a33; color:var(--purple); }
+.tool-name.tn-web_search { background:#1a2e1a; color:var(--green); }
+.tool-name.tn-calculate { background:#2a2310; color:var(--orange); }
+.tool-name.tn-get_datetime { background:#1c1c1c; color:var(--text-dim); }
+.tool-step pre { margin:3px 0 0; padding:4px 6px; background:var(--bg); border-radius:4px; font-size:10px; white-space:pre-wrap; word-break:break-all; max-height:80px; overflow-y:auto; color:var(--text-dim); font-family:'Cascadia Code','Fira Code',Consolas,monospace; }
+.agent-badge { display:inline-block; padding:1px 5px; border-radius:4px; font-size:9px; font-weight:700; background:rgba(188,140,255,0.15); color:var(--purple); margin-left:4px; text-transform:uppercase; letter-spacing:.3px; vertical-align:middle; }
 </style>
 </head>
 <body>
@@ -269,6 +300,14 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
       </div>
       <div id="tChat" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
         <div class="cmsg" id="chatMessages"><div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Messages go to your local Ollama</div></div></div>
+        <div class="usage-bar" id="usageBar">
+          <div class="ub-item"><span class="ub-label">Session:</span> <span class="ub-val accent" id="ubTotal">0</span> <span class="ub-label">tokens</span></div>
+          <div class="ub-sep"></div>
+          <div class="ub-item ub-msg"><span class="ub-dot in"></span> <span class="ub-val" id="ubLastIn">0</span></div>
+          <div class="ub-item ub-msg"><span class="ub-dot out"></span> <span class="ub-val" id="ubLastOut">0</span></div>
+          <div class="ub-sep"></div>
+          <div class="ub-item"><span class="ub-label">Requests:</span> <span class="ub-val" id="ubReqs">0</span></div>
+        </div>
         <div class="cinput">
           <div id="chatFilePreview" style="display:none;padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;margin-bottom:4px;font-size:11px;color:var(--text-dim)">
             <span id="chatFileName"></span>
@@ -455,6 +494,20 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
     <div class="mf"><label>Embedding Model</label><input id="cfgEmbeddingModel" placeholder="text-embedding-3-small or nomic-embed-text"></div>
     <div class="mf"><label>Top-K Results</label><input id="cfgRagTopK" type="number" min="1" max="20" value="5"></div>
 
+    <div style="border-top:1px solid var(--border);margin:14px 0 10px;padding-top:10px">
+      <div style="font-size:12px;font-weight:600;color:var(--purple);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Agent Mode</div>
+    </div>
+    <div class="mf" style="display:flex;align-items:center;gap:8px">
+      <label style="display:inline;margin:0">Enable Agent Mode</label>
+      <input type="checkbox" id="cfgAgentEnabled">
+    </div>
+    <div style="font-size:10px;color:var(--text-dim);margin:-8px 0 10px;padding-left:2px">When enabled, the LLM can autonomously call tools (DB, RAG, web search, calculator, etc.) to answer questions.</div>
+    <div class="mf"><label>Max Steps</label><input id="cfgAgentMaxSteps" type="number" min="1" max="20" value="8"></div>
+    <div class="mf" style="display:flex;align-items:center;gap:8px">
+      <label style="display:inline;margin:0">Web Search</label>
+      <input type="checkbox" id="cfgAgentWebSearch" checked>
+    </div>
+
     <div class="mactions"><button onclick="closeSettings()">Cancel</button><button class="primary" onclick="saveSettings()">Save</button></div>
   </div>
 </div>
@@ -490,6 +543,7 @@ function showDashboard(){
   applyRole(currentUser.role);
   connectSSE();
   loadModels();
+  loadUsage();
   if(currentUser.role==='admin'){
     loadCfg();
     statsInterval=setInterval(refreshStats,10000);
@@ -590,6 +644,41 @@ function onChatFileSelected(input){
 }
 function clearChatFile(){chatFileData=null;$('chatFileInput').value='';$('chatFilePreview').style.display='none';$('chatFileName').textContent=''}
 
+// ---- Token usage tracking ----
+let sessionUsage={prompt_tokens:0,completion_tokens:0,total_tokens:0,requests:0};
+function fmtTokens(n){if(n>=1000000)return(n/1000000).toFixed(1)+'M';if(n>=1000)return(n/1000).toFixed(1)+'k';return n.toString()}
+function updateUsageBar(msgUsage){
+  if(msgUsage&&msgUsage.total_tokens>0){
+    sessionUsage.prompt_tokens+=msgUsage.prompt_tokens||0;
+    sessionUsage.completion_tokens+=msgUsage.completion_tokens||0;
+    sessionUsage.total_tokens+=msgUsage.total_tokens||0;
+    sessionUsage.requests++;
+    $('ubLastIn').textContent=fmtTokens(msgUsage.prompt_tokens||0);
+    $('ubLastOut').textContent=fmtTokens(msgUsage.completion_tokens||0);
+  }
+  $('ubTotal').textContent=fmtTokens(sessionUsage.total_tokens);
+  $('ubReqs').textContent=sessionUsage.requests;
+  // Show bar only when there's actual usage (API/OAuth providers)
+  const bar=$('usageBar');
+  if(sessionUsage.total_tokens>0)bar.classList.add('visible');
+  else bar.classList.remove('visible');
+}
+function resetUsageBar(){sessionUsage={prompt_tokens:0,completion_tokens:0,total_tokens:0,requests:0};$('usageBar').classList.remove('visible')}
+// Fetch cumulative usage from server on login
+async function loadUsage(){
+  try{
+    const r=await fetch('/api/usage');if(!r.ok)return;
+    const d=await r.json();
+    if(d.user&&d.user.total_tokens>0){
+      sessionUsage=d.user;
+      $('ubTotal').textContent=fmtTokens(sessionUsage.total_tokens);
+      $('ubReqs').textContent=sessionUsage.requests;
+      $('ubLastIn').textContent='-';$('ubLastOut').textContent='-';
+      $('usageBar').classList.add('visible');
+    }
+  }catch(e){}
+}
+
 // ---- Chat ----
 async function sendChat(){
   if(sending)return;const inp=$('chatInput'),q=inp.value.trim();if(!q)return;
@@ -605,7 +694,7 @@ async function sendChat(){
     if(currentUser?.role==='admin')body.user_id=uid;
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();$('thinkInd')?.remove();
-    if(d.ok)chatHistory.push({role:'bot',content:d.answer,model:d.model,ms:d.duration_ms});
+    if(d.ok){chatHistory.push({role:'bot',content:d.answer,model:d.model,ms:d.duration_ms,usage:d.token_usage,tool_log:d.tool_log||null});updateUsageBar(d.token_usage)}
     else chatHistory.push({role:'error',content:d.error||'Unknown error'});
   }catch(err){$('thinkInd')?.remove();chatHistory.push({role:'error',content:err.message})}
   clearChatFile();
@@ -617,10 +706,22 @@ function renderChatMsgs(){
   c.innerHTML=chatHistory.map(m=>{
     if(m.role==='user')return`<div class="bubble q"><div class="bl">You</div>${esc(m.content)}</div>`;
     if(m.role==='error')return`<div class="bubble a" style="border-color:var(--red)"><div class="bl" style="color:var(--red)">Error</div>${esc(m.content)}</div>`;
-    return`<div class="bubble a"><div class="bl">Bot</div>${esc(m.content)}<div class="bm">${m.model?`<span>${esc(m.model)}</span>`:''}${m.ms?`<span>${fmtDur(m.ms)}</span>`:''}</div></div>`;
+    const tok=m.usage&&m.usage.total_tokens?` <span title="In: ${m.usage.prompt_tokens} / Out: ${m.usage.completion_tokens}">${fmtTokens(m.usage.total_tokens)} tok</span>`:'';
+    const agentBadge=m.tool_log&&m.tool_log.length?'<span class="agent-badge">Agent</span>':'';
+    const toolLogHtml=renderToolLog(m.tool_log);
+    return`<div class="bubble a"><div class="bl">Bot${agentBadge}</div>${esc(m.content)}${toolLogHtml}<div class="bm">${m.model?`<span>${esc(m.model)}</span>`:''}${m.ms?`<span>${fmtDur(m.ms)}</span>`:''}${tok}</div></div>`;
   }).join('');scrollChat();
 }
 function scrollChat(){const c=$('chatMessages');c.scrollTop=c.scrollHeight}
+function renderToolLog(log){
+  if(!log||!log.length)return'';
+  let steps=log.map(t=>{
+    const inp=typeof t.input==='object'?JSON.stringify(t.input):String(t.input||'');
+    const out=String(t.output||'').substring(0,500);
+    return`<div class="tool-step"><span class="tool-name tn-${esc(t.tool)}">${esc(t.tool)}</span> <span style="font-size:10px;color:var(--text-dim)">step ${t.step}</span><pre class="tool-input">${esc(inp)}</pre><pre class="tool-output">${esc(out)}</pre></div>`;
+  }).join('');
+  return`<div class="tool-log"><div class="tool-log-header" onclick="this.parentElement.classList.toggle('open')">🔧 ${log.length} tool${log.length>1?'s':''} used <span class="toggle-arrow">▶</span></div><div class="tool-log-body">${steps}</div></div>`;
+}
 $('chatInput').addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'});
 
 // ---- Feed ----
@@ -1036,6 +1137,10 @@ async function loadCfg(){
     $('cfgEmbeddingProvider').value=appCfg.embedding_provider||'auto';
     $('cfgEmbeddingModel').value=appCfg.embedding_model||'';
     $('cfgRagTopK').value=appCfg.rag_top_k||5;
+    // Agent settings
+    $('cfgAgentEnabled').checked=!!appCfg.agent_enabled;
+    $('cfgAgentMaxSteps').value=appCfg.agent_max_steps||8;
+    $('cfgAgentWebSearch').checked=appCfg.agent_web_search!==false;
     onProviderChange();
     await loadModels();
     $('cfgModel').value=appCfg.default_model||'';
@@ -1063,6 +1168,10 @@ async function saveSettings(){
     embedding_provider:$('cfgEmbeddingProvider').value,
     embedding_model:$('cfgEmbeddingModel').value,
     rag_top_k:parseInt($('cfgRagTopK').value)||5,
+    // Agent settings
+    agent_enabled:$('cfgAgentEnabled').checked,
+    agent_max_steps:parseInt($('cfgAgentMaxSteps').value)||8,
+    agent_web_search:$('cfgAgentWebSearch').checked,
   };
   // Only send API key if user changed it (not the masked value)
   const okey=$('cfgOpenaiKey').value;
