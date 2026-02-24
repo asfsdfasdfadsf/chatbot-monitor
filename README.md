@@ -8,18 +8,36 @@ Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL que
 Users → Web Chat → FastAPI Chatbot → LLM Provider
                         ↓ (import monitor)       ↑
               Admin Dashboard (localhost:7779) ───┘
-                  ↓ (cookie auth, roles)
+                  ↓ (cookie auth, PBKDF2)
             Admin: full control          Providers:
             Mitarbeiter: knowledge+chat  • Ollama (local)
             User: chat only              • OpenAI (ChatGPT OAuth / API key)
                                          • Anthropic (Claude)
-                                         • OpenRouter (OAuth, 200+ models)
-                  ↓
+                  ↓                      • OpenRouter (OAuth, 200+ models)
             Database (MSSQL / SQLite)
             Knowledge Base (RAG embeddings)
+            Event Buffer (deque, indexed by user)
 ```
 
 Everything runs on localhost — zero config, zero external dependencies for the core server.
+
+## Performance & Security
+
+The server is optimized for production use:
+
+### Performance
+- **O(1) event buffer** — uses `collections.deque(maxlen=5000)` instead of a list, so event ingestion never slows down as the buffer fills
+- **Pre-indexed lookups** — events are indexed by `user_id` on ingestion, making per-user queries instant instead of scanning all events
+- **Single-pass stats** — dashboard statistics are computed in one iteration over events instead of 6 separate passes
+- **Debounced persistence** — moderation updates are batched to avoid rewriting the entire events file on every action
+- **Cached tokenizer** — tiktoken encoding is initialized once and reused across all chunking operations
+
+### Security
+- **PBKDF2-SHA256 passwords** — 260,000 iterations (OWASP recommended), with automatic migration of legacy hashes on login
+- **Path traversal protection** — static file serving validates that resolved paths stay within the public directory
+- **Atomic lock scopes** — registration, login, and session operations use single lock scopes to prevent race conditions
+- **Read-only SQL** — all database queries are validated against a write-operation blocklist before execution
+- **Masked secrets** — API keys and tokens are never sent to the browser; only the last 4 characters are shown
 
 ## Features
 
@@ -144,7 +162,7 @@ The dashboard requires authentication. On page load, users see a login screen wi
 | **Mitarbeiter** | Chat, knowledge base (upload/manage documents), embedding stats, own events |
 | **User** | Chat tab, own events in feed |
 
-Sessions use HTTP cookies (24h expiry). No HTTPS required for LAN deployments.
+Sessions use HTTP cookies (24h expiry). Passwords are hashed with PBKDF2-SHA256 (260k iterations). No HTTPS required for LAN deployments.
 
 ### Default Admin
 
@@ -591,7 +609,7 @@ The test suite covers 221 tests across authentication, role-based access, event 
 
 | File | Description |
 |------|-------------|
-| `server.py` | HTTP server: auth, events, SSE, multi-provider LLM, database, RAG, user/account management |
+| `server.py` | HTTP server: auth (PBKDF2), events (deque + indexed), SSE, multi-provider LLM, agent mode, database, RAG, user/account management |
 | `monitor.py` | Python SDK: fire-and-forget logging, wrappers, middleware |
 | `public/index.html` | Dashboard UI: login, chat, feed, stats, admin panels, knowledge base |
 | `test_all.py` | Comprehensive test suite (221 tests) |
