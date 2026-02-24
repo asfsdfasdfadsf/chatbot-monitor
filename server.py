@@ -23,7 +23,7 @@ import uuid
 import io
 import threading
 import queue
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -115,8 +115,11 @@ config_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-events: list[dict] = []
+events: deque[dict] = deque(maxlen=MAX_EVENTS)  # O(1) append + auto-eviction
 events_lock = threading.Lock()
+# Pre-indexed event lookups (kept in sync with events deque)
+_events_by_user: dict[str, list[dict]] = defaultdict(list)  # user_id -> [evt, ...]
+_events_by_type: dict[str, int] = defaultdict(int)  # type -> count
 moderation: dict[str, dict] = {}
 moderation_lock = threading.Lock()
 sse_clients: list[tuple[queue.Queue, dict]] = []  # (queue, session_info)
@@ -165,14 +168,87 @@ def extract_topics(text: str, top_n: int = 5) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Password hashing
+# Shared multipart parser
 # ---------------------------------------------------------------------------
+def _parse_multipart(content_type: str, body: bytes) -> tuple[str, bytes]:
+    """Parse multipart/form-data and extract the first file. Returns (filename, file_bytes)."""
+    boundary = None
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.startswith("boundary="):
+            boundary = part[9:].strip('"')
+            break
+    if not boundary:
+        return "", b""
+
+    parts = body.split(("--" + boundary).encode())
+    for part in parts:
+        if b"Content-Disposition" not in part:
+            continue
+        header_end = part.find(b"\r\n\r\n")
+        if header_end == -1:
+            continue
+        headers_raw = part[:header_end].decode("utf-8", errors="replace")
+        body_raw = part[header_end + 4:]
+        if body_raw.endswith(b"\r\n"):
+            body_raw = body_raw[:-2]
+        fn_match = re.search(r'filename="([^"]*)"', headers_raw)
+        if fn_match and fn_match.group(1):
+            return fn_match.group(1), body_raw
+    return "", b""
+
+
+# ---------------------------------------------------------------------------
+# Cached tiktoken encoding
+# ---------------------------------------------------------------------------
+_tiktoken_encoding = None
+_tiktoken_init = False
+
+
+def _count_tokens(text: str) -> int:
+    """Count tokens using tiktoken (cached) or fallback to char/4."""
+    global _tiktoken_encoding, _tiktoken_init
+    if not _tiktoken_init:
+        _tiktoken_init = True
+        if HAS_TIKTOKEN:
+            try:
+                _tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                pass
+    if _tiktoken_encoding is not None:
+        return len(_tiktoken_encoding.encode(text))
+    return len(text) // 4
+
+
+# ---------------------------------------------------------------------------
+# Password hashing (PBKDF2-SHA256, 260k iterations)
+# ---------------------------------------------------------------------------
+_PBKDF2_ITERATIONS = 260_000
+_PBKDF2_PREFIX = "pbkdf2:"
+
+
 def _hash_password(password: str, salt: str) -> str:
+    """Hash password with PBKDF2-SHA256. Returns prefixed hash for migration detection."""
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), _PBKDF2_ITERATIONS)
+    return _PBKDF2_PREFIX + dk.hex()
+
+
+def _hash_password_legacy(password: str, salt: str) -> str:
+    """Legacy SHA-256 hash for backward compatibility checking."""
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 
 def _verify_password(password: str, password_hash: str, salt: str) -> bool:
-    return secrets.compare_digest(_hash_password(password, salt), password_hash)
+    """Verify password against hash. Supports both PBKDF2 and legacy SHA-256."""
+    if password_hash.startswith(_PBKDF2_PREFIX):
+        return secrets.compare_digest(_hash_password(password, salt), password_hash)
+    # Legacy SHA-256 fallback
+    return secrets.compare_digest(_hash_password_legacy(password, salt), password_hash)
+
+
+def _needs_rehash(password_hash: str) -> bool:
+    """Check if a stored hash needs upgrading to PBKDF2."""
+    return not password_hash.startswith(_PBKDF2_PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +277,8 @@ def save_accounts():
 def ensure_default_admin():
     with accounts_lock:
         has_admin = any(a.get("role") == "admin" for a in accounts.values())
-    if not has_admin:
-        salt = secrets.token_hex(16)
-        with accounts_lock:
+        if not has_admin:
+            salt = secrets.token_hex(16)
             accounts["admin"] = {
                 "username": "admin",
                 "password_hash": _hash_password("admin", salt),
@@ -212,6 +287,7 @@ def ensure_default_admin():
                 "priority": "normal",
                 "created_at": time.time(),
             }
+    if not has_admin:
         save_accounts()
         print("[chatbot-monitor] Created default admin account (admin/admin)")
 
@@ -237,10 +313,9 @@ def get_session_by_id(sid: str) -> dict | None:
         return None
     with sessions_lock:
         s = sessions.get(sid)
-    if s and s["expires_at"] > time.time():
-        return s
-    if s:
-        with sessions_lock:
+        if s and s["expires_at"] > time.time():
+            return s
+        if s:
             sessions.pop(sid, None)
     return None
 
@@ -585,21 +660,25 @@ def is_user_allowed(user_id: str) -> bool:
 
 
 def get_user_summary(user_id: str) -> dict:
-    """Get user info + recent activity from events."""
+    """Get user info + recent activity from events (uses pre-indexed lookups)."""
     with users_lock:
         u = dict(users.get(user_id, {}))
     if not u:
         u = {"user_id": user_id, "status": "unknown"}
 
-    # Compute live stats from events
     with events_lock:
-        user_events = [e for e in events if e.get("user_id") == user_id]
+        user_events = _events_by_user.get(user_id, [])
+        total = len(user_events)
+        chats = sum(1 for e in user_events if e.get("type") == "chat")
+        queries = sum(1 for e in user_events if e.get("type") == "query")
+        errors = sum(1 for e in user_events if e.get("type") == "error")
+        recent = user_events[-20:]
 
-    u["total_events"] = len(user_events)
-    u["total_chats"] = sum(1 for e in user_events if e["type"] == "chat")
-    u["total_queries"] = sum(1 for e in user_events if e["type"] == "query")
-    u["total_errors"] = sum(1 for e in user_events if e["type"] == "error")
-    u["recent_events"] = user_events[-20:]  # last 20
+    u["total_events"] = total
+    u["total_chats"] = chats
+    u["total_queries"] = queries
+    u["total_errors"] = errors
+    u["recent_events"] = recent
     return u
 
 
@@ -623,7 +702,15 @@ def load_events():
                         moderation[evt["id"]] = mod
                 except json.JSONDecodeError:
                     continue
-    events = loaded[-MAX_EVENTS:]
+    events = deque(loaded[-MAX_EVENTS:], maxlen=MAX_EVENTS)
+    # Rebuild indexes
+    _events_by_user.clear()
+    _events_by_type.clear()
+    for evt in events:
+        uid = evt.get("user_id")
+        if uid:
+            _events_by_user[uid].append(evt)
+        _events_by_type[evt.get("type", "unknown")] += 1
 
 
 def rebuild_users_from_events():
@@ -647,26 +734,50 @@ def append_event_to_file(evt: dict):
         print(f"[persist] Error writing event: {e}", file=sys.stderr)
 
 
+_moderation_save_pending = False
+_moderation_save_lock = threading.Lock()
+
+
 def persist_moderation(event_id: str, mod: dict):
-    try:
-        with events_lock:
-            for evt in events:
-                if evt["id"] == event_id:
-                    evt["_moderation"] = mod
-                    break
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+    """Update moderation on event in memory; batch-write to disk (debounced)."""
+    global _moderation_save_pending
+    with events_lock:
+        for evt in events:
+            if evt["id"] == event_id:
+                evt["_moderation"] = mod
+                break
+
+    # Debounce: only rewrite file once even if many moderation updates come quickly
+    with _moderation_save_lock:
+        if _moderation_save_pending:
+            return
+        _moderation_save_pending = True
+
+    def _flush():
+        global _moderation_save_pending
+        time.sleep(2)  # batch writes within 2 seconds
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
             with events_lock:
-                for evt in events:
+                snapshot = list(events)
+            with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+                for evt in snapshot:
                     f.write(json.dumps(evt, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[persist] Error writing moderation: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[persist] Error writing moderation: {e}", file=sys.stderr)
+        finally:
+            with _moderation_save_lock:
+                _moderation_save_pending = False
+
+    threading.Thread(target=_flush, daemon=True).start()
 
 
 def clear_all_events():
-    global events, moderation
+    global moderation
     with events_lock:
-        events = []
+        events.clear()
+        _events_by_user.clear()
+        _events_by_type.clear()
     with moderation_lock:
         moderation = {}
     try:
@@ -698,9 +809,22 @@ def ingest_event(evt: dict) -> dict:
             increment_user_stat(uid, "error_count")
 
     with events_lock:
+        # If deque is full, the oldest event is auto-evicted — update index
+        if len(events) == events.maxlen:
+            old = events[0]
+            old_uid = old.get("user_id")
+            if old_uid and old_uid in _events_by_user:
+                user_list = _events_by_user[old_uid]
+                if user_list and user_list[0] is old:
+                    user_list.pop(0)
+            old_type = old.get("type", "unknown")
+            if _events_by_type[old_type] > 0:
+                _events_by_type[old_type] -= 1
         events.append(evt)
-        while len(events) > MAX_EVENTS:
-            events.pop(0)
+        # Update indexes
+        if uid:
+            _events_by_user[uid].append(evt)
+        _events_by_type[evt.get("type", "system")] += 1
 
     append_event_to_file(evt)
     broadcast_event(evt)
@@ -1662,6 +1786,21 @@ def _call_with_text_fallback(messages: list, model: str, temperature: float, too
     return answer, None, usage
 
 
+# --- Agent tool execution helper ---
+
+def _run_tool_and_log(tc: dict, step: int, tool_log: list, run_id: str, user_id: str) -> str:
+    """Execute a single tool call, log it, broadcast SSE event. Returns result string."""
+    t0 = time.time()
+    result_str = _execute_tool(tc["name"], tc["arguments"])
+    tool_ms = (time.time() - t0) * 1000
+    tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step})
+    print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+    broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
+        "step": step, "tool": tc["name"], "input": tc["arguments"],
+        "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
+    return result_str
+
+
 # --- Core agent loop ---
 
 def run_agent_loop(messages: list, model: str, temperature: float,
@@ -1738,14 +1877,7 @@ def run_agent_loop(messages: list, model: str, temperature: float,
 
             tool_results_content = []
             for tc in tool_calls:
-                t0 = time.time()
-                result_str = _execute_tool(tc["name"], tc["arguments"])
-                tool_ms = (time.time() - t0) * 1000
-                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
-                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
-                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
-                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
-                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
+                result_str = _run_tool_and_log(tc, step + 1, tool_log, run_id, user_id)
                 tool_results_content.append({
                     "type": "tool_result",
                     "tool_use_id": tc.get("id", f"tool_{step}_{tc['name']}"),
@@ -1768,14 +1900,7 @@ def run_agent_loop(messages: list, model: str, temperature: float,
 
             for i, tc in enumerate(tool_calls):
                 call_id = tc.get("id", f"call_{step}_{i}")
-                t0 = time.time()
-                result_str = _execute_tool(tc["name"], tc["arguments"])
-                tool_ms = (time.time() - t0) * 1000
-                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
-                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
-                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
-                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
-                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
+                result_str = _run_tool_and_log(tc, step + 1, tool_log, run_id, user_id)
                 working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result_str})
 
         elif use_native and provider == "ollama":
@@ -1789,14 +1914,7 @@ def run_agent_loop(messages: list, model: str, temperature: float,
             working_messages.append(assistant_msg)
 
             for tc in tool_calls:
-                t0 = time.time()
-                result_str = _execute_tool(tc["name"], tc["arguments"])
-                tool_ms = (time.time() - t0) * 1000
-                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
-                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
-                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
-                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
-                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
+                result_str = _run_tool_and_log(tc, step + 1, tool_log, run_id, user_id)
                 working_messages.append({"role": "tool", "content": result_str})
 
         else:
@@ -1805,14 +1923,7 @@ def run_agent_loop(messages: list, model: str, temperature: float,
                 working_messages.append({"role": "assistant", "content": text})
             parts = []
             for tc in tool_calls:
-                t0 = time.time()
-                result_str = _execute_tool(tc["name"], tc["arguments"])
-                tool_ms = (time.time() - t0) * 1000
-                tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
-                print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
-                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
-                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
-                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
+                result_str = _run_tool_and_log(tc, step + 1, tool_log, run_id, user_id)
                 parts.append(f'<tool_result name="{tc["name"]}">{result_str}</tool_result>')
             working_messages.append({"role": "user", "content": "\n".join(parts)})
 
@@ -2238,15 +2349,6 @@ def chunk_tabular_text(text: str, chunk_size: int = 500) -> list:
     sections = re.split(r"(?=^## )", text, flags=re.MULTILINE)
     chunks = []
 
-    def _count_tokens(t):
-        if HAS_TIKTOKEN:
-            try:
-                enc = tiktoken.get_encoding("cl100k_base")
-                return len(enc.encode(t))
-            except Exception:
-                pass
-        return len(t) // 4
-
     for section in sections:
         section = section.strip()
         if not section:
@@ -2283,15 +2385,6 @@ def chunk_text(text: str, chunk_size: int = 500) -> list:
     paragraphs = re.split(r"\n\s*\n", text)
     chunks = []
     current_chunk = ""
-
-    def _count_tokens(t):
-        if HAS_TIKTOKEN:
-            try:
-                enc = tiktoken.get_encoding("cl100k_base")
-                return len(enc.encode(t))
-            except Exception:
-                pass
-        return len(t) // 4  # rough fallback
 
     for para in paragraphs:
         para = para.strip()
@@ -2357,13 +2450,7 @@ def store_document(filename: str, content: str, username: str) -> dict:
                 print(f"[embed] Error embedding chunk {i}: {e}", file=sys.stderr)
                 emb_blob = b""
 
-            token_count = len(chunk_content) // 4
-            if HAS_TIKTOKEN:
-                try:
-                    enc = tiktoken.get_encoding("cl100k_base")
-                    token_count = len(enc.encode(chunk_content))
-                except Exception:
-                    pass
+            token_count = _count_tokens(chunk_content)
 
             conn.execute(
                 "INSERT INTO chunks (id, doc_id, content, chunk_index, embedding, token_count) VALUES (?,?,?,?,?,?)",
@@ -2555,46 +2642,60 @@ def update_document(doc_id: str, filename: str | None, content: str | None, user
 # Stats
 # ---------------------------------------------------------------------------
 def compute_stats() -> dict:
-    with events_lock:
-        evts = list(events)
-
     now = time.time()
     one_hour_ago = now - 3600
+    twenty_four_ago = now - 86400
 
-    total = len(evts)
-    chats = [e for e in evts if e.get("type") == "chat"]
-    queries = [e for e in evts if e.get("type") == "query"]
-    errors = [e for e in evts if e.get("type") == "error"]
-
+    # Single pass over events
+    total = 0
+    chat_count = 0
+    query_count = 0
+    error_count = 0
     recent_users = set()
     recent_msgs = 0
-    for e in evts:
-        ts = e.get("timestamp", 0)
-        if ts > one_hour_ago:
-            uid = e.get("user_id")
-            if uid:
-                recent_users.add(uid)
-            if e.get("type") == "chat":
-                recent_msgs += 1
-
-    durations = [c.get("duration_ms", 0) for c in chats if c.get("duration_ms")]
-    avg_response = (sum(durations) / len(durations)) if durations else 0
-
-    query_durations = [q.get("duration_ms", 0) for q in queries if q.get("duration_ms")]
-    avg_query = (sum(query_durations) / len(query_durations)) if query_durations else 0
-
-    error_rate = (len(errors) / total * 100) if total > 0 else 0
-
-    all_questions = " ".join(c.get("question", "") for c in chats)
-    topics = extract_topics(all_questions, top_n=10)
-
+    chat_durations = []
+    query_durations = []
+    questions = []
     hourly = defaultdict(int)
-    twenty_four_ago = now - 86400
-    for e in evts:
-        ts = e.get("timestamp", 0)
-        if ts > twenty_four_ago and e.get("type") == "chat":
-            hour = datetime.fromtimestamp(ts).strftime("%H:00")
-            hourly[hour] += 1
+    type_counts = defaultdict(int)
+
+    with events_lock:
+        total = len(events)
+        for e in events:
+            etype = e.get("type", "unknown")
+            type_counts[etype] += 1
+            ts = e.get("timestamp", 0)
+            uid = e.get("user_id")
+
+            if etype == "chat":
+                chat_count += 1
+                dur = e.get("duration_ms")
+                if dur:
+                    chat_durations.append(dur)
+                q = e.get("question", "")
+                if q:
+                    questions.append(q)
+                if ts > twenty_four_ago:
+                    hour = datetime.fromtimestamp(ts).strftime("%H:00")
+                    hourly[hour] += 1
+            elif etype == "query":
+                query_count += 1
+                dur = e.get("duration_ms")
+                if dur:
+                    query_durations.append(dur)
+            elif etype == "error":
+                error_count += 1
+
+            if ts > one_hour_ago:
+                if uid:
+                    recent_users.add(uid)
+                if etype == "chat":
+                    recent_msgs += 1
+
+    avg_response = (sum(chat_durations) / len(chat_durations)) if chat_durations else 0
+    avg_query = (sum(query_durations) / len(query_durations)) if query_durations else 0
+    error_rate = (error_count / total * 100) if total > 0 else 0
+    topics = extract_topics(" ".join(questions), top_n=10)
     hourly_sorted = dict(sorted(hourly.items()))
 
     with moderation_lock:
@@ -2602,19 +2703,15 @@ def compute_stats() -> dict:
         reviewed_count = sum(1 for m in moderation.values() if m.get("reviewed"))
         unreviewed = flagged_count - reviewed_count
 
-    type_counts = defaultdict(int)
-    for e in evts:
-        type_counts[e.get("type", "unknown")] += 1
-
     with users_lock:
         blocked_count = sum(1 for u in users.values() if u.get("status") == "blocked")
         total_users = len(users)
 
     return {
         "total_events": total,
-        "total_chats": len(chats),
-        "total_queries": len(queries),
-        "total_errors": len(errors),
+        "total_chats": chat_count,
+        "total_queries": query_count,
+        "total_errors": error_count,
         "active_users": len(recent_users),
         "total_users": total_users,
         "blocked_users": blocked_count,
@@ -2636,16 +2733,17 @@ def compute_stats() -> dict:
 # ---------------------------------------------------------------------------
 def broadcast_event(evt: dict):
     data = json.dumps(evt, ensure_ascii=False)
-    dead = []
     with sse_lock:
+        alive = []
         for client_entry in sse_clients:
             q = client_entry[0]
             try:
                 q.put_nowait(data)
+                alive.append(client_entry)
             except queue.Full:
-                dead.append(client_entry)
-        for item in dead:
-            sse_clients.remove(item)
+                pass  # drop dead clients
+        if len(alive) < len(sse_clients):
+            sse_clients[:] = alive
 
 
 # ---------------------------------------------------------------------------
@@ -2860,13 +2958,23 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
         with accounts_lock:
             acct = accounts.get(username)
-        if not acct or not _verify_password(password, acct["password_hash"], acct["salt"]):
-            self._send_json({"error": "invalid_credentials"}, 401)
-            return
+            if not acct or not _verify_password(password, acct["password_hash"], acct["salt"]):
+                self._send_json({"error": "invalid_credentials"}, 401)
+                return
+            # Auto-upgrade legacy SHA-256 hashes to PBKDF2 on successful login
+            if _needs_rehash(acct["password_hash"]):
+                acct["password_hash"] = _hash_password(password, acct["salt"])
+                _rehash_save = True
+            else:
+                _rehash_save = False
+            role = acct["role"]
 
-        sid = create_session(username, acct["role"])
+        if _rehash_save:
+            save_accounts()
+
+        sid = create_session(username, role)
         self._send_json(
-            {"ok": True, "user": {"username": username, "role": acct["role"]}},
+            {"ok": True, "user": {"username": username, "role": role}},
             headers=[self._session_cookie(sid)],
         )
 
@@ -2890,13 +2998,11 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "password too short"}, 400)
             return
 
+        salt = secrets.token_hex(16)
         with accounts_lock:
             if username in accounts:
                 self._send_json({"error": "username_taken"}, 409)
                 return
-
-        salt = secrets.token_hex(16)
-        with accounts_lock:
             accounts[username] = {
                 "username": username,
                 "password_hash": _hash_password(password, salt),
@@ -2966,34 +3072,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            boundary = None
-            for part in ctype.split(";"):
-                part = part.strip()
-                if part.startswith("boundary="):
-                    boundary = part[9:].strip('"')
-                    break
-            if not boundary:
-                self._send_json({"error": "No boundary"}, 400)
-                return
-
             body = self._read_body()
-            parts = body.split(("--" + boundary).encode())
-            filename = ""
-            file_bytes = b""
-            for part in parts:
-                if b"Content-Disposition" not in part:
-                    continue
-                header_end = part.find(b"\r\n\r\n")
-                if header_end == -1:
-                    continue
-                headers_raw = part[:header_end].decode("utf-8", errors="replace")
-                body_raw = part[header_end + 4:]
-                if body_raw.endswith(b"\r\n"):
-                    body_raw = body_raw[:-2]
-                fn_match = re.search(r'filename="([^"]*)"', headers_raw)
-                if fn_match and fn_match.group(1):
-                    filename = fn_match.group(1)
-                    file_bytes = body_raw
+            filename, file_bytes = _parse_multipart(ctype, body)
 
             if not file_bytes:
                 self._send_json({"error": "No file content"}, 400)
@@ -3876,7 +3956,11 @@ class MonitorHandler(SimpleHTTPRequestHandler):
     def _serve_static(self, path: str):
         if path == "/" or path == "":
             path = "/index.html"
-        filepath = PUBLIC_DIR / path.lstrip("/")
+        filepath = (PUBLIC_DIR / path.lstrip("/")).resolve()
+        # Prevent path traversal — resolved path must be inside PUBLIC_DIR
+        if not str(filepath).startswith(str(PUBLIC_DIR.resolve())):
+            self._send_json({"error": "Forbidden"}, 403)
+            return
         if not filepath.exists() or not filepath.is_file():
             self._send_json({"error": "Not found"}, 404)
             return
@@ -4053,15 +4137,15 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 
     def _handle_get_users(self):
         with users_lock:
-            user_list = list(users.values())
-        # Enrich with live event counts
+            user_list = [dict(u) for u in users.values()]
+        # Enrich with live event counts using pre-indexed lookups
         with events_lock:
             for u in user_list:
                 uid = u["user_id"]
-                user_evts = [e for e in events if e.get("user_id") == uid]
+                user_evts = _events_by_user.get(uid, [])
                 u["total_events"] = len(user_evts)
-                u["total_chats"] = sum(1 for e in user_evts if e["type"] == "chat")
-                u["total_errors"] = sum(1 for e in user_evts if e["type"] == "error")
+                u["total_chats"] = sum(1 for e in user_evts if e.get("type") == "chat")
+                u["total_errors"] = sum(1 for e in user_evts if e.get("type") == "error")
 
         user_list.sort(key=lambda x: -x.get("last_seen", 0))
         self._send_json({"users": user_list})
@@ -4170,44 +4254,8 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            # Parse boundary from content type
-            boundary = None
-            for part in ctype.split(";"):
-                part = part.strip()
-                if part.startswith("boundary="):
-                    boundary = part[9:].strip('"')
-                    break
-            if not boundary:
-                self._send_json({"error": "No boundary in Content-Type"}, 400)
-                return
-
             body = self._read_body()
-            # Parse multipart manually (avoid cgi.FieldStorage deprecation)
-            parts = body.split(("--" + boundary).encode())
-            filename = ""
-            file_bytes = b""
-            for part in parts:
-                if b"Content-Disposition" not in part:
-                    continue
-                # Extract headers and body
-                header_end = part.find(b"\r\n\r\n")
-                if header_end == -1:
-                    continue
-                headers_raw = part[:header_end].decode("utf-8", errors="replace")
-                body_raw = part[header_end + 4:]
-                # Strip trailing \r\n--
-                if body_raw.endswith(b"\r\n"):
-                    body_raw = body_raw[:-2]
-
-                # Get filename if present
-                fn_match = re.search(r'filename="([^"]*)"', headers_raw)
-                name_match = re.search(r'name="([^"]*)"', headers_raw)
-
-                if fn_match and fn_match.group(1):
-                    filename = fn_match.group(1)
-                    file_bytes = body_raw
-                elif name_match and name_match.group(1) == "filename":
-                    filename = body_raw.decode("utf-8", errors="replace").strip()
+            filename, file_bytes = _parse_multipart(ctype, body)
 
             if not file_bytes:
                 self._send_json({"error": "No file content found"}, 400)
