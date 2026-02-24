@@ -227,6 +227,113 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .tool-name.tn-get_datetime { background:#1c1c1c; color:var(--text-dim); }
 .tool-step pre { margin:3px 0 0; padding:4px 6px; background:var(--bg); border-radius:4px; font-size:10px; white-space:pre-wrap; word-break:break-all; max-height:80px; overflow-y:auto; color:var(--text-dim); font-family:'Cascadia Code','Fira Code',Consolas,monospace; }
 .agent-badge { display:inline-block; padding:1px 5px; border-radius:4px; font-size:9px; font-weight:700; background:rgba(188,140,255,0.15); color:var(--purple); margin-left:4px; text-transform:uppercase; letter-spacing:.3px; vertical-align:middle; }
+
+/* Agent Viewer Panel */
+.agent-panel { position:fixed; top:0; right:0; width:440px; height:100vh; background:var(--bg); border-left:1px solid var(--border); z-index:100; display:flex; flex-direction:column; transform:translateX(100%); transition:transform .3s ease; box-shadow:-4px 0 24px rgba(0,0,0,.4); }
+.agent-panel.open { transform:translateX(0); }
+.ap-header { padding:10px 14px; background:var(--surface); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; flex-shrink:0; }
+.ap-header .ap-title { font-size:13px; font-weight:600; flex:1; }
+.ap-header .ap-status { font-size:11px; padding:2px 8px; border-radius:10px; }
+.ap-status.running { background:rgba(88,166,255,.15); color:var(--accent); }
+.ap-status.thinking { background:rgba(188,140,255,.15); color:var(--purple); }
+.ap-status.done { background:rgba(63,185,80,.15); color:var(--green); }
+.ap-status.error { background:rgba(248,81,73,.15); color:var(--red); }
+.ap-close { background:none; border:1px solid var(--border); color:var(--text-dim); width:26px; height:26px; border-radius:6px; cursor:pointer; font-size:14px; display:flex; align-items:center; justify-content:center; transition:all .15s; }
+.ap-close:hover { border-color:var(--text-dim); color:var(--text); }
+.ap-body { flex:1; display:flex; overflow:hidden; }
+.ap-timeline { width:140px; border-right:1px solid var(--border); overflow-y:auto; flex-shrink:0; padding:6px; }
+.ap-timeline::-webkit-scrollbar { width:4px; }
+.ap-timeline::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+.ap-titem { padding:6px 8px; border-radius:6px; margin-bottom:4px; cursor:pointer; border:1px solid transparent; transition:all .15s; position:relative; }
+.ap-titem:hover { background:var(--surface2); }
+.ap-titem.active { background:var(--surface2); border-color:var(--accent); }
+.ap-titem .ap-tn { font-size:10px; font-weight:600; margin-bottom:2px; display:flex; align-items:center; gap:4px; }
+.ap-titem .ap-td { font-size:9px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ap-titem .ap-tms { font-size:9px; color:var(--text-dim); margin-top:1px; }
+.ap-tc-db { color:var(--accent); }
+.ap-tc-web { color:var(--green); }
+.ap-tc-rag { color:var(--purple); }
+.ap-tc-calc { color:var(--orange); }
+.ap-tc-time { color:var(--cyan); }
+.ap-tc-think { color:var(--text-dim); }
+.ap-tc-done { color:var(--green); }
+.ap-tc-generic { color:var(--text); }
+.ap-viewer { flex:1; overflow-y:auto; padding:12px; }
+.ap-viewer::-webkit-scrollbar { width:5px; }
+.ap-viewer::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* Thinking orb */
+.apv-thinking { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:16px; }
+.apv-orb { width:80px; height:80px; border-radius:50%; background:radial-gradient(circle at 35% 35%, var(--purple), var(--accent)); animation:apv-pulse 2s ease-in-out infinite; box-shadow:0 0 30px rgba(188,140,255,.3); }
+@keyframes apv-pulse { 0%,100%{transform:scale(1);opacity:.8} 50%{transform:scale(1.12);opacity:1} }
+.apv-orb-label { font-size:12px; color:var(--text-dim); }
+
+/* DB viewer */
+.apv-db { font-family:'Cascadia Code','Fira Code',Consolas,monospace; }
+.apv-db .apv-titlebar { display:flex; align-items:center; gap:6px; padding:6px 10px; background:#2d2d2d; border-radius:8px 8px 0 0; }
+.apv-db .apv-dot { width:10px; height:10px; border-radius:50%; }
+.apv-db .apv-dot.r { background:#ff5f57; }
+.apv-db .apv-dot.y { background:#febc2e; }
+.apv-db .apv-dot.g { background:#28c840; }
+.apv-db .apv-db-title { font-size:11px; color:#999; margin-left:6px; }
+.apv-db .apv-sql { padding:10px 12px; background:#1a1a2e; font-size:12px; color:#c792ea; white-space:pre-wrap; word-break:break-all; line-height:1.5; }
+.apv-db .apv-sql .kw { color:#c792ea; font-weight:600; }
+.apv-db .apv-result { padding:10px 12px; background:#0d1117; border-radius:0 0 8px 8px; font-size:11px; color:var(--text); overflow-x:auto; }
+.apv-db .apv-result table { width:100%; border-collapse:collapse; }
+.apv-db .apv-result th { text-align:left; padding:3px 8px; border-bottom:1px solid var(--border); color:var(--accent); font-size:10px; font-weight:600; }
+.apv-db .apv-result td { padding:3px 8px; border-bottom:1px solid rgba(48,54,61,.4); font-size:10px; color:var(--text-dim); }
+
+/* Browser/WebSearch viewer */
+.apv-browser { border-radius:8px; overflow:hidden; border:1px solid var(--border); }
+.apv-browser .apv-bar { display:flex; align-items:center; gap:6px; padding:6px 10px; background:#292d33; }
+.apv-browser .apv-bar-dots { display:flex; gap:4px; }
+.apv-browser .apv-bar-dots span { width:10px; height:10px; border-radius:50%; }
+.apv-browser .apv-bar-dots span:nth-child(1) { background:#ff5f57; }
+.apv-browser .apv-bar-dots span:nth-child(2) { background:#febc2e; }
+.apv-browser .apv-bar-dots span:nth-child(3) { background:#28c840; }
+.apv-browser .apv-url { flex:1; background:#1a1d23; border:1px solid var(--border); border-radius:14px; padding:4px 10px; font-size:11px; color:var(--text-dim); font-family:inherit; }
+.apv-browser .apv-page { padding:14px; background:#fff; color:#202124; font-family:Arial,sans-serif; min-height:120px; }
+.apv-browser .apv-ddg-logo { font-size:18px; font-weight:700; color:#de5833; margin-bottom:10px; }
+.apv-browser .apv-ddg-logo span { color:#4c9; }
+.apv-browser .apv-sresult { margin-bottom:12px; }
+.apv-browser .apv-sresult a { color:#1a0dab; font-size:13px; text-decoration:none; font-weight:500; }
+.apv-browser .apv-sresult a:hover { text-decoration:underline; }
+.apv-browser .apv-sresult .apv-surl { color:#006621; font-size:11px; margin:1px 0; }
+.apv-browser .apv-sresult .apv-ssnip { color:#545454; font-size:12px; line-height:1.4; }
+
+/* RAG/Knowledge search viewer */
+.apv-rag { }
+.apv-rag .apv-qbar { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--surface); border:1px solid var(--border); border-radius:8px; margin-bottom:10px; }
+.apv-rag .apv-qbar svg { width:16px; height:16px; fill:var(--purple); flex-shrink:0; }
+.apv-rag .apv-qbar span { font-size:12px; color:var(--text); }
+.apv-rag .apv-chunk { padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:8px; margin-bottom:6px; }
+.apv-rag .apv-chunk-hdr { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+.apv-rag .apv-chunk-idx { font-size:10px; font-weight:600; color:var(--purple); }
+.apv-rag .apv-chunk-score { font-size:10px; padding:1px 6px; border-radius:8px; background:rgba(188,140,255,.12); color:var(--purple); }
+.apv-rag .apv-chunk-text { font-size:11px; color:var(--text-dim); line-height:1.5; max-height:80px; overflow:hidden; }
+
+/* Calculator viewer */
+.apv-calc { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:8px; }
+.apv-calc .apv-expr { font-size:18px; font-family:'Cascadia Code','Fira Code',Consolas,monospace; color:var(--text); text-align:center; word-break:break-all; padding:0 12px; }
+.apv-calc .apv-eq { font-size:28px; color:var(--text-dim); }
+.apv-calc .apv-result { font-size:32px; font-weight:700; color:var(--green); font-family:'Cascadia Code','Fira Code',Consolas,monospace; }
+
+/* Clock viewer */
+.apv-clock { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:6px; }
+.apv-clock .apv-time { font-size:40px; font-weight:700; font-family:'Cascadia Code','Fira Code',Consolas,monospace; color:var(--text); letter-spacing:2px; }
+.apv-clock .apv-date { font-size:14px; color:var(--text-dim); }
+
+/* Generic tool viewer */
+.apv-generic { }
+.apv-generic .apv-gtool { font-size:12px; font-weight:600; padding:2px 8px; border-radius:4px; background:var(--surface2); color:var(--accent); display:inline-block; margin-bottom:8px; }
+.apv-generic .apv-glabel { font-size:10px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px; margin-top:8px; }
+.apv-generic .apv-gblock { padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:6px; font-family:'Cascadia Code','Fira Code',Consolas,monospace; font-size:11px; color:var(--text-dim); white-space:pre-wrap; word-break:break-all; max-height:200px; overflow-y:auto; }
+
+/* Done state */
+.apv-done { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:10px; }
+.apv-done-check { width:48px; height:48px; border-radius:50%; background:rgba(63,185,80,.15); display:flex; align-items:center; justify-content:center; font-size:24px; color:var(--green); }
+.apv-done-label { font-size:13px; color:var(--text-dim); }
+.apv-done-stats { font-size:11px; color:var(--text-dim); display:flex; gap:12px; }
 </style>
 </head>
 <body>
@@ -406,6 +513,21 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
           <div id="kbSearchResults"></div>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Agent Viewer Panel -->
+<div class="agent-panel" id="agentPanel">
+  <div class="ap-header">
+    <div class="ap-title">Agent Viewer</div>
+    <span class="ap-status running" id="apStatus">Running</span>
+    <button class="ap-close" id="apClose" onclick="closeAgentPanel()" title="Close">&times;</button>
+  </div>
+  <div class="ap-body">
+    <div class="ap-timeline" id="apTimeline"></div>
+    <div class="ap-viewer" id="apViewer">
+      <div class="apv-thinking"><div class="apv-orb"></div><div class="apv-orb-label">Waiting for agent...</div></div>
     </div>
   </div>
 </div>
@@ -612,6 +734,10 @@ function connectSSE(){
     if(evt.type==='_clear'){events=[];moderation={};selectedId=null;renderFeed();renderSql();if(currentUser?.role==='admin')refreshStats();$('detailBody').innerHTML='<div class="dempty">Select an event</div>';$('modBar').style.display='none';return}
     if(evt.type==='_moderation_update'){moderation[evt.event_id]=evt.moderation;renderFeed();if(selectedId===evt.event_id)renderDetail(selectedId);if(currentUser?.role==='admin')refreshStats();return}
     if(evt.type==='_user_update'){if(usersMap[evt.user_id])usersMap[evt.user_id].status=evt.status;renderUsers();if(selectedUser===evt.user_id)showUserDetail(evt.user_id);return}
+    if(evt.type==='_agent_start'){handleAgentStart(evt);return}
+    if(evt.type==='_agent_thinking'){handleAgentThinking(evt);return}
+    if(evt.type==='_agent_step'){handleAgentStep(evt);return}
+    if(evt.type==='_agent_done'){handleAgentDone(evt);return}
     events.push(evt);if(events.length>5000)events.shift();
     addFeedItem(evt);if(evt.type==='query')addSqlItem(evt);
     if(evt.user_id&&evt.user_id!=='admin'){
@@ -723,6 +849,189 @@ function renderToolLog(log){
   return`<div class="tool-log"><div class="tool-log-header" onclick="this.parentElement.classList.toggle('open')">🔧 ${log.length} tool${log.length>1?'s':''} used <span class="toggle-arrow">▶</span></div><div class="tool-log-body">${steps}</div></div>`;
 }
 $('chatInput').addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'});
+
+// ---- Agent Viewer Panel ----
+let agentRunId=null,agentSteps=[],agentAutoFollow=true,agentActiveStep=-1,agentPanelOpen=false;
+
+function openAgentPanel(){
+  agentPanelOpen=true;
+  $('agentPanel').classList.add('open');
+}
+function closeAgentPanel(){
+  agentPanelOpen=false;
+  $('agentPanel').classList.remove('open');
+}
+
+function toolColor(name){
+  if(name==='query_database'||name==='list_tables')return'db';
+  if(name==='web_search')return'web';
+  if(name==='search_knowledge')return'rag';
+  if(name==='calculate')return'calc';
+  if(name==='get_datetime')return'time';
+  return'generic';
+}
+
+function handleAgentStart(d){
+  agentRunId=d.run_id;agentSteps=[];agentAutoFollow=true;agentActiveStep=-1;
+  $('apTimeline').innerHTML='';
+  $('apStatus').className='ap-status running';$('apStatus').textContent='Running';
+  $('apViewer').innerHTML='<div class="apv-thinking"><div class="apv-orb"></div><div class="apv-orb-label">Agent starting...</div></div>';
+  openAgentPanel();
+}
+
+function handleAgentThinking(d){
+  if(d.run_id!==agentRunId)return;
+  const ti=document.createElement('div');
+  ti.className='ap-titem';ti.dataset.idx='think-'+d.step;
+  ti.innerHTML=`<div class="ap-tn"><span class="ap-tc-think">&#9679;</span> Step ${d.step}</div><div class="ap-td">Thinking...</div>`;
+  $('apTimeline').appendChild(ti);
+  $('apTimeline').scrollTop=$('apTimeline').scrollHeight;
+  if(agentAutoFollow){
+    setActiveTimelineItem(ti);
+    $('apViewer').innerHTML='<div class="apv-thinking"><div class="apv-orb"></div><div class="apv-orb-label">Thinking... (step '+d.step+')</div></div>';
+  }
+}
+
+function handleAgentStep(d){
+  if(d.run_id!==agentRunId)return;
+  const idx=agentSteps.length;
+  agentSteps.push(d);
+  const tc=toolColor(d.tool);
+  // Remove last "thinking" item for this step
+  const thinkEl=$('apTimeline').querySelector(`[data-idx="think-${d.step}"]`);
+  if(thinkEl)thinkEl.remove();
+  // Add step item
+  const ti=document.createElement('div');
+  ti.className='ap-titem';ti.dataset.idx=idx;
+  const inp=typeof d.input==='object'?Object.values(d.input).join(' '):String(d.input||'');
+  ti.innerHTML=`<div class="ap-tn"><span class="ap-tc-${tc}">&#9679;</span> ${escA(d.tool)}</div><div class="ap-td">${escA(inp.slice(0,40))}</div><div class="ap-tms">${d.duration_ms}ms</div>`;
+  ti.onclick=()=>{agentAutoFollow=false;agentActiveStep=idx;renderAgentViewer(idx);setActiveTimelineItem(ti)};
+  $('apTimeline').appendChild(ti);
+  $('apTimeline').scrollTop=$('apTimeline').scrollHeight;
+  $('apStatus').className='ap-status running';$('apStatus').textContent=`Step ${d.step}`;
+  if(agentAutoFollow){agentActiveStep=idx;renderAgentViewer(idx);setActiveTimelineItem(ti)}
+}
+
+function handleAgentDone(d){
+  if(d.run_id!==agentRunId)return;
+  const isErr=d.error===true;
+  $('apStatus').className=isErr?'ap-status error':'ap-status done';
+  $('apStatus').textContent=isErr?'Error':'Done';
+  // Add done item to timeline
+  const ti=document.createElement('div');
+  ti.className='ap-titem';ti.dataset.idx='done';
+  ti.innerHTML=`<div class="ap-tn"><span class="ap-tc-${isErr?'generic':'done'}">&#9679;</span> ${isErr?'Error':'Done'}</div><div class="ap-td">${d.total_steps} steps, ${fmtDur(d.duration_ms)}</div>`;
+  ti.onclick=()=>{agentAutoFollow=false;renderAgentDone(d);setActiveTimelineItem(ti)};
+  $('apTimeline').appendChild(ti);
+  $('apTimeline').scrollTop=$('apTimeline').scrollHeight;
+  if(agentAutoFollow){renderAgentDone(d);setActiveTimelineItem(ti)}
+}
+
+function setActiveTimelineItem(el){
+  $('apTimeline').querySelectorAll('.ap-titem').forEach(t=>t.classList.remove('active'));
+  if(el)el.classList.add('active');
+}
+
+function renderAgentViewer(idx){
+  const step=agentSteps[idx];if(!step)return;
+  const v=$('apViewer');
+  switch(step.tool){
+    case'query_database':case'list_tables':v.innerHTML=renderDbView(step);break;
+    case'web_search':v.innerHTML=renderWebSearchView(step);break;
+    case'search_knowledge':v.innerHTML=renderRagView(step);break;
+    case'calculate':v.innerHTML=renderCalcView(step);break;
+    case'get_datetime':v.innerHTML=renderClockView(step);break;
+    default:v.innerHTML=renderGenericToolView(step);
+  }
+}
+
+function renderDbView(step){
+  const sql=typeof step.input==='object'?(step.input.sql||JSON.stringify(step.input)):String(step.input||'');
+  const hlSql=sql.replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|ORDER BY|GROUP BY|HAVING|LIMIT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|AS|IN|NOT|NULL|IS|LIKE|BETWEEN|COUNT|SUM|AVG|MAX|MIN|DISTINCT|UNION|CASE|WHEN|THEN|ELSE|END)\b/gi,m=>'<span class="kw">'+m.toUpperCase()+'</span>');
+  let resultHtml='';
+  const out=String(step.output||'');
+  // Try to parse as markdown table
+  const lines=out.split('\n').filter(l=>l.trim());
+  const hasTable=lines.length>=3&&lines[1]&&lines[1].includes('---');
+  if(hasTable){
+    const headers=lines[0].split('|').map(h=>h.trim()).filter(Boolean);
+    const rows=lines.slice(2).map(r=>r.split('|').map(c=>c.trim()).filter(Boolean));
+    resultHtml='<table><thead><tr>'+headers.map(h=>'<th>'+escA(h)+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+r.map(c=>'<td>'+escA(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+  } else {
+    resultHtml='<pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;word-break:break-all">'+escA(out)+'</pre>';
+  }
+  return`<div class="apv-db"><div class="apv-titlebar"><div class="apv-dot r"></div><div class="apv-dot y"></div><div class="apv-dot g"></div><div class="apv-db-title">${escA(step.tool)} &mdash; ${step.duration_ms}ms</div></div><div class="apv-sql">${hlSql}</div><div class="apv-result">${resultHtml}</div></div>`;
+}
+
+function renderWebSearchView(step){
+  const query=typeof step.input==='object'?(step.input.query||''):String(step.input||'');
+  const out=String(step.output||'');
+  // Parse DuckDuckGo-style results
+  const results=[];
+  const blocks=out.split(/\n\n+/);
+  for(const b of blocks){
+    const m=b.match(/^(\d+)\.\s*\[(.+?)\]\((.+?)\)\s*\n(.+)/s);
+    if(m){results.push({title:m[2],url:m[3],snippet:m[4].trim()})}
+    else if(b.trim()&&results.length<8){
+      const simpleM=b.match(/^(\d+)\.\s*(.+?)[\n:]\s*(.+)/s);
+      if(simpleM){results.push({title:simpleM[2],url:'',snippet:simpleM[3].trim().slice(0,200)})}
+    }
+  }
+  let resultsHtml=results.length?results.map(r=>
+    `<div class="apv-sresult"><a>${escA(r.title)}</a>${r.url?'<div class="apv-surl">'+escA(r.url)+'</div>':''}<div class="apv-ssnip">${escA(r.snippet.slice(0,200))}</div></div>`
+  ).join(''):`<div style="color:#545454;font-size:12px;padding:8px 0">${escA(out.slice(0,500))}</div>`;
+  return`<div class="apv-browser"><div class="apv-bar"><div class="apv-bar-dots"><span></span><span></span><span></span></div><div class="apv-url">duckduckgo.com/?q=${escA(query)}</div></div><div class="apv-page"><div class="apv-ddg-logo">Duck<span>Duck</span>Go</div>${resultsHtml}</div></div>`;
+}
+
+function renderRagView(step){
+  const query=typeof step.input==='object'?(step.input.query||''):String(step.input||'');
+  const out=String(step.output||'');
+  // Parse numbered results
+  const chunks=[];
+  const parts=out.split(/\n\n+/);
+  for(const p of parts){
+    const m=p.match(/^(\d+)\.\s*\[Score:\s*([\d.]+)\]\s*(.+)/s);
+    if(m)chunks.push({idx:m[1],score:m[2],text:m[3].trim()});
+  }
+  let chunksHtml=chunks.length?chunks.map(c=>{
+    const sc=parseFloat(c.score);const col=sc>0.7?'var(--green)':sc>0.4?'var(--orange)':'var(--text-dim)';
+    return`<div class="apv-chunk"><div class="apv-chunk-hdr"><span class="apv-chunk-idx">Chunk ${c.idx}</span><span class="apv-chunk-score" style="color:${col};background:${col}20">${(sc*100).toFixed(0)}%</span></div><div class="apv-chunk-text">${escA(c.text.slice(0,300))}</div></div>`;
+  }).join(''):`<div style="font-size:11px;color:var(--text-dim);padding:8px">${escA(out.slice(0,500))}</div>`;
+  const svgSearch='<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><line x1="16.5" y1="16.5" x2="21" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+  return`<div class="apv-rag"><div class="apv-qbar">${svgSearch}<span>${escA(query)}</span></div>${chunksHtml}</div>`;
+}
+
+function renderCalcView(step){
+  const expr=typeof step.input==='object'?(step.input.expression||''):String(step.input||'');
+  const result=String(step.output||'');
+  return`<div class="apv-calc"><div class="apv-expr">${escA(expr)}</div><div class="apv-eq">=</div><div class="apv-result">${escA(result)}</div></div>`;
+}
+
+function renderClockView(step){
+  const out=String(step.output||'');
+  // Parse German datetime format "Montag, 24. Februar 2026, 14:30:45 Uhr"
+  const timeM=out.match(/(\d{1,2}:\d{2}:\d{2})/);
+  const timeStr=timeM?timeM[1]:out;
+  const dateStr=out.replace(/,?\s*\d{1,2}:\d{2}:\d{2}\s*Uhr\s*$/,'').trim();
+  return`<div class="apv-clock"><div class="apv-time">${escA(timeStr)}</div><div class="apv-date">${escA(dateStr)}</div></div>`;
+}
+
+function renderGenericToolView(step){
+  const inp=typeof step.input==='object'?JSON.stringify(step.input,null,2):String(step.input||'');
+  const out=String(step.output||'').slice(0,1000);
+  return`<div class="apv-generic"><span class="apv-gtool">${escA(step.tool)}</span><div style="font-size:10px;color:var(--text-dim);margin-bottom:8px">Step ${step.step} &mdash; ${step.duration_ms}ms</div><div class="apv-glabel">Input</div><div class="apv-gblock">${escA(inp)}</div><div class="apv-glabel">Output</div><div class="apv-gblock">${escA(out)}</div></div>`;
+}
+
+function renderAgentDone(d){
+  const isErr=d.error===true;
+  if(isErr){
+    $('apViewer').innerHTML=`<div class="apv-done"><div class="apv-done-check" style="background:rgba(248,81,73,.15);color:var(--red)">!</div><div class="apv-done-label" style="color:var(--red)">Agent Error</div><div style="font-size:11px;color:var(--text-dim);text-align:center;padding:0 12px">${escA(String(d.answer||''))}</div></div>`;
+  } else {
+    $('apViewer').innerHTML=`<div class="apv-done"><div class="apv-done-check">&#10003;</div><div class="apv-done-label">Agent Complete</div><div class="apv-done-stats"><span>${d.total_steps} steps</span><span>${fmtDur(d.duration_ms)}</span></div></div>`;
+  }
+}
+
+function escA(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
 // ---- Feed ----
 function renderFeed(){$('feedBody').innerHTML='';getFiltered().forEach(e=>addFeedItem(e,false));scrollFeed()}

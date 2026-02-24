@@ -729,7 +729,7 @@ def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[s
         f"{ollama_url}/api/chat", data=data,
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    resp = urlopen(req, timeout=120)
+    resp = urlopen(req, timeout=600)
     result = json.loads(resp.read())
     answer = result.get("message", {}).get("content", "")
     # Ollama returns eval_count (output tokens) and prompt_eval_count (input tokens)
@@ -1433,7 +1433,7 @@ def _call_ollama_with_tools(messages: list, model: str, temperature: float, tool
         f"{ollama_url}/api/chat", data=data,
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    resp = urlopen(req, timeout=120)
+    resp = urlopen(req, timeout=600)
     result = json.loads(resp.read())
     usage = {
         "prompt_tokens": result.get("prompt_eval_count", 0),
@@ -1665,7 +1665,8 @@ def _call_with_text_fallback(messages: list, model: str, temperature: float, too
 # --- Core agent loop ---
 
 def run_agent_loop(messages: list, model: str, temperature: float,
-                   available_tools: list, max_steps: int = 8) -> tuple:
+                   available_tools: list, max_steps: int = 8,
+                   user_id: str = "", run_id: str = "") -> tuple:
     """Run the agent loop. Returns (final_answer, tool_log, total_usage)."""
     tool_log = []
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -1677,8 +1678,16 @@ def run_agent_loop(messages: list, model: str, temperature: float,
     # Working copy of messages
     working_messages = list(messages)
 
+    loop_start = time.time()
+    broadcast_event({"type": "_agent_start", "run_id": run_id, "user_id": user_id,
+        "question": messages[-1].get("content", "") if messages else "",
+        "available_tools": [t["name"] for t in available_tools],
+        "max_steps": max_steps, "model": model, "timestamp": time.time()})
+
     for step in range(max_steps):
         print(f"[agent] Step {step+1}/{max_steps}, provider={provider}, native={use_native}", file=sys.stderr)
+        broadcast_event({"type": "_agent_thinking", "run_id": run_id, "user_id": user_id,
+            "step": step + 1, "timestamp": time.time()})
 
         try:
             if use_native:
@@ -1707,6 +1716,9 @@ def run_agent_loop(messages: list, model: str, temperature: float,
             final = text or ""
             if step == 0 and not final:
                 final = "(No response from model)"
+            broadcast_event({"type": "_agent_done", "run_id": run_id, "user_id": user_id,
+                "answer": final[:500], "total_steps": len(tool_log),
+                "duration_ms": round((time.time() - loop_start) * 1000, 1), "timestamp": time.time()})
             return final, tool_log, total_usage
 
         # Execute tool calls and build follow-up messages
@@ -1726,9 +1738,14 @@ def run_agent_loop(messages: list, model: str, temperature: float,
 
             tool_results_content = []
             for tc in tool_calls:
+                t0 = time.time()
                 result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_ms = (time.time() - t0) * 1000
                 tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
                 print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
+                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
+                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
                 tool_results_content.append({
                     "type": "tool_result",
                     "tool_use_id": tc.get("id", f"tool_{step}_{tc['name']}"),
@@ -1751,9 +1768,14 @@ def run_agent_loop(messages: list, model: str, temperature: float,
 
             for i, tc in enumerate(tool_calls):
                 call_id = tc.get("id", f"call_{step}_{i}")
+                t0 = time.time()
                 result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_ms = (time.time() - t0) * 1000
                 tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
                 print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
+                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
+                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
                 working_messages.append({"role": "tool", "tool_call_id": call_id, "content": result_str})
 
         elif use_native and provider == "ollama":
@@ -1767,9 +1789,14 @@ def run_agent_loop(messages: list, model: str, temperature: float,
             working_messages.append(assistant_msg)
 
             for tc in tool_calls:
+                t0 = time.time()
                 result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_ms = (time.time() - t0) * 1000
                 tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
                 print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
+                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
+                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
                 working_messages.append({"role": "tool", "content": result_str})
 
         else:
@@ -1778,9 +1805,14 @@ def run_agent_loop(messages: list, model: str, temperature: float,
                 working_messages.append({"role": "assistant", "content": text})
             parts = []
             for tc in tool_calls:
+                t0 = time.time()
                 result_str = _execute_tool(tc["name"], tc["arguments"])
+                tool_ms = (time.time() - t0) * 1000
                 tool_log.append({"tool": tc["name"], "input": tc["arguments"], "output": result_str, "step": step + 1})
                 print(f"[agent]   Tool: {tc['name']}({tc['arguments']}) -> {result_str[:200]}", file=sys.stderr)
+                broadcast_event({"type": "_agent_step", "run_id": run_id, "user_id": user_id,
+                    "step": step + 1, "tool": tc["name"], "input": tc["arguments"],
+                    "output": result_str[:2000], "duration_ms": round(tool_ms, 1), "timestamp": time.time()})
                 parts.append(f'<tool_result name="{tc["name"]}">{result_str}</tool_result>')
             working_messages.append({"role": "user", "content": "\n".join(parts)})
 
@@ -1788,6 +1820,9 @@ def run_agent_loop(messages: list, model: str, temperature: float,
     last_text = text or ""
     if tool_log:
         last_text += "\n\n(Agent reached maximum step limit)"
+    broadcast_event({"type": "_agent_done", "run_id": run_id, "user_id": user_id,
+        "answer": last_text[:500], "total_steps": len(tool_log),
+        "duration_ms": round((time.time() - loop_start) * 1000, 1), "timestamp": time.time()})
     return last_text, tool_log, total_usage
 
 
@@ -3310,13 +3345,17 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     messages.insert(0, {"role": "system", "content": agent_sys})
 
                 try:
+                    agent_run_id = str(uuid.uuid4())
                     answer, tool_log, agent_usage = run_agent_loop(
                         messages, model, temperature, available_tools,
-                        max_steps=agent_max_steps
+                        max_steps=agent_max_steps, user_id=user_id, run_id=agent_run_id
                     )
                     for k in total_usage:
                         total_usage[k] += agent_usage.get(k, 0)
                 except Exception as e:
+                    broadcast_event({"type": "_agent_done", "run_id": agent_run_id, "user_id": user_id,
+                        "answer": f"Error: {e}", "total_steps": 0, "error": True,
+                        "duration_ms": round((time.time() - total_start) * 1000, 1), "timestamp": time.time()})
                     ingest_event({
                         "type": "error", "message": str(e),
                         "error_type": "agent_error", "user_id": user_id,
@@ -3922,7 +3961,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                             evt_type = evt.get("type", "")
                             evt_uid = evt.get("user_id", "")
                             # Skip admin-only internal events
-                            if evt_type.startswith("_") and evt_type != "_clear":
+                            if evt_type.startswith("_") and evt_type != "_clear" and not evt_type.startswith("_agent_"):
                                 continue
                             # Skip other users' events
                             if evt_uid and evt_uid != session["username"]:
