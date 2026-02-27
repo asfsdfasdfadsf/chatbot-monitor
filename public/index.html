@@ -85,6 +85,8 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .dots span { width:6px; height:6px; border-radius:50%; background:var(--text-dim); animation:pulse 1.4s infinite both; }
 .dots span:nth-child(2) { animation-delay:.2s; } .dots span:nth-child(3) { animation-delay:.4s; }
 @keyframes pulse { 0%,80%,100%{opacity:.3;transform:scale(.8)} 40%{opacity:1;transform:scale(1)} }
+.stream-cursor { color:var(--accent); animation:blink 1s step-end infinite; }
+@keyframes blink { 50%{opacity:0} }
 
 /* Detail */
 .dempty { display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-dim); }
@@ -223,6 +225,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .tool-name.tn-query_database, .tool-name.tn-list_tables { background:#1a2332; color:var(--accent); }
 .tool-name.tn-search_knowledge { background:#1f1a33; color:var(--purple); }
 .tool-name.tn-web_search { background:#1a2e1a; color:var(--green); }
+.tool-name.tn-search_emails, .tool-name.tn-read_email { background:#1a2e2e; color:var(--cyan); }
 .tool-name.tn-calculate { background:#2a2310; color:var(--orange); }
 .tool-name.tn-get_datetime { background:#1c1c1c; color:var(--text-dim); }
 .tool-step pre { margin:3px 0 0; padding:4px 6px; background:var(--bg); border-radius:4px; font-size:10px; white-space:pre-wrap; word-break:break-all; max-height:80px; overflow-y:auto; color:var(--text-dim); font-family:'Cascadia Code','Fira Code',Consolas,monospace; }
@@ -257,6 +260,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .ap-tc-time { color:var(--cyan); }
 .ap-tc-think { color:var(--text-dim); }
 .ap-tc-done { color:var(--green); }
+.ap-tc-email { color:var(--cyan); }
 .ap-tc-generic { color:var(--text); }
 .ap-viewer { flex:1; overflow-y:auto; padding:12px; }
 .ap-viewer::-webkit-scrollbar { width:5px; }
@@ -322,6 +326,19 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .apv-clock { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:6px; }
 .apv-clock .apv-time { font-size:40px; font-weight:700; font-family:'Cascadia Code','Fira Code',Consolas,monospace; color:var(--text); letter-spacing:2px; }
 .apv-clock .apv-date { font-size:14px; color:var(--text-dim); }
+
+/* Email viewer */
+.apv-email { }
+.apv-email-hdr { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--surface); border:1px solid var(--border); border-radius:8px; margin-bottom:8px; font-size:12px; font-weight:600; color:var(--cyan); }
+.apv-email-count { margin-left:auto; font-size:10px; font-weight:400; color:var(--text-dim); }
+.apv-email-list { }
+.apv-email-item { padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:6px; margin-bottom:4px; cursor:default; }
+.apv-email-item:hover { border-color:var(--cyan); }
+.apv-email-from { font-size:11px; font-weight:600; color:var(--text); margin-bottom:2px; }
+.apv-email-subj { font-size:11px; color:var(--text-dim); margin-bottom:2px; }
+.apv-email-date { font-size:10px; color:var(--text-dim); }
+.apv-email-meta { padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:6px; margin-bottom:8px; font-size:11px; line-height:1.8; color:var(--text-dim); }
+.apv-email-body { padding:10px 12px; background:var(--surface); border:1px solid var(--border); border-radius:6px; font-size:11px; color:var(--text); line-height:1.6; white-space:pre-wrap; word-break:break-word; max-height:300px; overflow-y:auto; }
 
 /* Generic tool viewer */
 .apv-generic { }
@@ -416,12 +433,13 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
           <div class="ub-item"><span class="ub-label">Requests:</span> <span class="ub-val" id="ubReqs">0</span></div>
         </div>
         <div class="cinput">
+          <div id="dsgvoChatBanner" style="display:none;padding:4px 10px;background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.3);border-radius:4px;margin-bottom:4px;font-size:10px;color:var(--orange)">DSGVO: Online-Provider aktiv &mdash; DB, RAG und E-Mail-Zugriff gesperrt</div>
           <div id="chatFilePreview" style="display:none;padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;margin-bottom:4px;font-size:11px;color:var(--text-dim)">
             <span id="chatFileName"></span>
             <button onclick="clearChatFile()" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:13px;margin-left:6px" title="Datei entfernen">&times;</button>
           </div>
           <div class="crow">
-            <input type="file" id="chatFileInput" accept=".txt,.md,.csv,.json,.log,.xlsx,.xls" style="display:none" onchange="onChatFileSelected(this)">
+            <input type="file" id="chatFileInput" accept=".txt,.md,.csv,.json,.log,.xlsx,.xls,.pdf,.docx,.xml,.html,.htm,.yaml,.yml,.ini,.cfg,.sql,.py,.js,.ts,.tsx,.jsx,.java,.cs,.cpp,.c,.h,.sh,.bat,.ps1,.toml,.properties" style="display:none" onchange="onChatFileSelected(this)">
             <button onclick="$('chatFileInput').click()" title="Datei anhängen" style="min-height:38px;padding:8px 10px;font-size:16px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text-dim);cursor:pointer">&#128206;</button>
             <textarea class="cin" id="chatInput" rows="1" placeholder="Type a message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
             <button class="csend" id="chatSendBtn" onclick="sendChat()">Send</button>
@@ -488,7 +506,7 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
           <div class="sc admin-only" style="padding:10px">
             <div class="sl">Upload Document</div>
             <div style="margin-top:8px">
-              <input type="file" id="kbFileInput" accept=".txt,.md,.csv,.json,.log,.xlsx,.xls" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;display:block;width:100%">
+              <input type="file" id="kbFileInput" accept=".txt,.md,.csv,.json,.log,.xlsx,.xls,.pdf,.docx,.xml,.html,.htm,.yaml,.yml,.ini,.cfg,.sql,.py,.js,.ts,.tsx,.jsx,.java,.cs,.cpp,.c,.h,.sh,.bat,.ps1,.toml,.properties" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;display:block;width:100%">
               <button class="mbtn" onclick="uploadKbFile()" style="font-size:11px;width:100%;margin-top:4px">Upload File</button>
             </div>
             <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
@@ -570,6 +588,10 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
     <div class="mf"><label>System Prompt</label><textarea id="cfgPrompt" placeholder="e.g. Du bist ein WaWi-Assistent."></textarea></div>
     <div class="mf"><label>Temperature</label><input id="cfgTemp" type="number" min="0" max="2" step="0.1" value="0.7"></div>
 
+    <div id="dsgvoSettingsWarn" style="display:none;background:rgba(210,153,34,.12);border:1px solid var(--orange);border-radius:6px;padding:10px 12px;margin:10px 0;font-size:11px;color:var(--orange)">
+      <strong>DSGVO-Hinweis:</strong> Bei Online-Providern (OpenAI, Anthropic, OpenRouter) werden Datenbank-, Wissensdatenbank- und E-Mail-Zugriff automatisch gesperrt, da Daten an externe Server gesendet wuerden. Nur mit Ollama (lokal) sind alle Tools verfuegbar.
+    </div>
+
     <div style="border-top:1px solid var(--border);margin:14px 0 10px;padding-top:10px">
       <div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Database Connection</div>
     </div>
@@ -628,6 +650,25 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
     <div class="mf" style="display:flex;align-items:center;gap:8px">
       <label style="display:inline;margin:0">Web Search</label>
       <input type="checkbox" id="cfgAgentWebSearch" checked>
+    </div>
+
+    <div style="border-top:1px solid var(--border);margin:14px 0 10px;padding-top:10px">
+      <div style="font-size:12px;font-weight:600;color:var(--cyan);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Email (IMAP)</div>
+    </div>
+    <div class="mf" style="display:flex;align-items:center;gap:8px">
+      <label style="display:inline;margin:0">Enable Email Access</label>
+      <input type="checkbox" id="cfgEmailEnabled">
+    </div>
+    <div style="font-size:10px;color:var(--text-dim);margin:-8px 0 10px;padding-left:2px">Allows the agent to search and read emails. Only available with Ollama (DSGVO).</div>
+    <div class="mf"><label>IMAP Server</label><input id="cfgEmailImapServer" value="outlook.office365.com" placeholder="outlook.office365.com"></div>
+    <div class="mf"><label>IMAP Port</label><input id="cfgEmailImapPort" type="number" value="993" placeholder="993"></div>
+    <div class="mf"><label>Email Address</label><input id="cfgEmailAddress" placeholder="info@example.com"></div>
+    <div class="mf"><label>Password</label>
+      <div style="display:flex;gap:4px"><input id="cfgEmailPassword" type="password" placeholder="****" style="flex:1"><button class="mbtn" style="font-size:10px;white-space:nowrap" onclick="toggleKeyVis('cfgEmailPassword',this)">Show</button></div>
+    </div>
+    <div class="mf">
+      <button class="mbtn" onclick="testEmailConnection()" id="btnTestEmail" style="font-size:12px;padding:6px 14px">Test Connection</button>
+      <span id="emailTestResult" style="font-size:11px;margin-left:8px"></span>
     </div>
 
     <div class="mactions"><button onclick="closeSettings()">Cancel</button><button class="primary" onclick="saveSettings()">Save</button></div>
@@ -708,7 +749,7 @@ async function doAuth(){
       const msg=d.error==='invalid_credentials'?'Invalid username or password':d.error==='username_taken'?'Username already taken':d.error||'Login failed';
       $('authError').textContent=msg;
     }
-  }catch(e){$('authError').textContent='Connection error'}
+  }catch(e){$('authError').textContent='Connection error: '+e.message}
   $('authBtn').disabled=false;
 }
 async function doLogout(){
@@ -818,10 +859,52 @@ async function sendChat(){
     const body={question:q,model};
     if(chatFileData){body.file_context=chatFileData.content;body.file_name=chatFileData.filename}
     if(currentUser?.role==='admin')body.user_id=uid;
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const d=await r.json();$('thinkInd')?.remove();
-    if(d.ok){chatHistory.push({role:'bot',content:d.answer,model:d.model,ms:d.duration_ms,usage:d.token_usage,tool_log:d.tool_log||null});updateUsageBar(d.token_usage)}
-    else chatHistory.push({role:'error',content:d.error||'Unknown error'});
+    const r=await fetch('/api/chat?stream=1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const ct=r.headers.get('content-type')||'';
+    if(ct.includes('text/event-stream')){
+      // Streaming response — render tokens live
+      $('thinkInd')?.remove();
+      const liveBub=document.createElement('div');liveBub.className='bubble a';
+      liveBub.innerHTML='<div class="bl">Bot</div><span class="stream-text"></span><span class="stream-cursor">▌</span><div class="bm" style="display:none"></div>';
+      $('chatMessages').appendChild(liveBub);scrollChat();
+      const stEl=liveBub.querySelector('.stream-text');
+      const bmEl=liveBub.querySelector('.bm');
+      let fullText='',meta=null;
+      const reader=r.body.getReader();
+      const decoder=new TextDecoder();
+      let buf='';
+      while(true){
+        const{done,value}=await reader.read();
+        if(done)break;
+        buf+=decoder.decode(value,{stream:true});
+        const lines=buf.split('\n');
+        buf=lines.pop();
+        for(const line of lines){
+          if(!line.startsWith('data: '))continue;
+          try{
+            const d=JSON.parse(line.slice(6));
+            if(d.token){fullText+=d.token;stEl.textContent=fullText;scrollChat()}
+            if(d.error){fullText='Error: '+d.error;stEl.textContent=fullText}
+            if(d.done){meta=d}
+          }catch(e){}
+        }
+      }
+      liveBub.querySelector('.stream-cursor')?.remove();
+      if(meta){
+        bmEl.style.display='';
+        bmEl.innerHTML=(meta.model?`<span>${esc(meta.model)}</span>`:'')+(meta.duration_ms?`<span>${fmtDur(meta.duration_ms)}</span>`:'')+
+          (meta.token_usage&&meta.token_usage.total_tokens?` <span title="In: ${meta.token_usage.prompt_tokens} / Out: ${meta.token_usage.completion_tokens}">${fmtTokens(meta.token_usage.total_tokens)} tok</span>`:'');
+        chatHistory.push({role:'bot',content:fullText,model:meta.model,ms:meta.duration_ms,usage:meta.token_usage||null,tool_log:null});
+        updateUsageBar(meta.token_usage);
+      }else{
+        chatHistory.push({role:'bot',content:fullText,model,ms:0,usage:null,tool_log:null});
+      }
+    }else{
+      // Non-streaming fallback (agent mode, DB mode, or server doesn't support stream)
+      const d=await r.json();$('thinkInd')?.remove();
+      if(d.ok){chatHistory.push({role:'bot',content:d.answer,model:d.model,ms:d.duration_ms,usage:d.token_usage,tool_log:d.tool_log||null});updateUsageBar(d.token_usage)}
+      else chatHistory.push({role:'error',content:d.error||'Unknown error'});
+    }
   }catch(err){$('thinkInd')?.remove();chatHistory.push({role:'error',content:err.message})}
   clearChatFile();
   sending=false;$('chatSendBtn').disabled=false;renderChatMsgs();$('chatInput').focus();
@@ -868,6 +951,7 @@ function toolColor(name){
   if(name==='search_knowledge')return'rag';
   if(name==='calculate')return'calc';
   if(name==='get_datetime')return'time';
+  if(name==='search_emails'||name==='read_email')return'email';
   return'generic';
 }
 
@@ -941,6 +1025,8 @@ function renderAgentViewer(idx){
     case'search_knowledge':v.innerHTML=renderRagView(step);break;
     case'calculate':v.innerHTML=renderCalcView(step);break;
     case'get_datetime':v.innerHTML=renderClockView(step);break;
+    case'search_emails':v.innerHTML=renderEmailSearchView(step);break;
+    case'read_email':v.innerHTML=renderEmailReadView(step);break;
     default:v.innerHTML=renderGenericToolView(step);
   }
 }
@@ -999,6 +1085,37 @@ function renderRagView(step){
   }).join(''):`<div style="font-size:11px;color:var(--text-dim);padding:8px">${escA(out.slice(0,500))}</div>`;
   const svgSearch='<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><line x1="16.5" y1="16.5" x2="21" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
   return`<div class="apv-rag"><div class="apv-qbar">${svgSearch}<span>${escA(query)}</span></div>${chunksHtml}</div>`;
+}
+
+function renderEmailSearchView(step){
+  const inp=typeof step.input==='object'?step.input:{};
+  const query=inp.query||inp.sender||inp.subject||'';
+  const out=String(step.output||'');
+  const emails=[];
+  const lines=out.split('\n').filter(l=>l.trim());
+  for(const line of lines){
+    const m=line.match(/^UID:\s*(\S+)\s*\|\s*From:\s*(.*?)\s*\|\s*Subject:\s*(.*?)\s*\|\s*Date:\s*(.*)$/);
+    if(m)emails.push({uid:m[1],from:m[2],subject:m[3],date:m[4]});
+  }
+  let listHtml=emails.length?emails.map(e=>
+    `<div class="apv-email-item"><div class="apv-email-from">${escA(e.from)}</div><div class="apv-email-subj">${escA(e.subject)}</div><div class="apv-email-date">${escA(e.date)}</div></div>`
+  ).join(''):`<div style="font-size:11px;color:var(--text-dim);padding:8px">${escA(out.slice(0,500))}</div>`;
+  return`<div class="apv-email"><div class="apv-email-hdr"><span style="font-size:16px">&#9993;</span> <span>Inbox Search: ${escA(query)}</span> <span class="apv-email-count">${emails.length} results</span></div><div class="apv-email-list">${listHtml}</div></div>`;
+}
+
+function renderEmailReadView(step){
+  const uid=typeof step.input==='object'?(step.input.uid||''):String(step.input||'');
+  const out=String(step.output||'');
+  // Parse header fields
+  const fromM=out.match(/^From:\s*(.*)$/m);
+  const toM=out.match(/^To:\s*(.*)$/m);
+  const subjM=out.match(/^Subject:\s*(.*)$/m);
+  const dateM=out.match(/^Date:\s*(.*)$/m);
+  const attM=out.match(/^Attachments:\s*(.*)$/m);
+  // Body is everything after the headers
+  const bodyStart=out.indexOf('\n\n');
+  const body=bodyStart>=0?out.slice(bodyStart+2):'';
+  return`<div class="apv-email"><div class="apv-email-hdr"><span style="font-size:16px">&#9993;</span> <span>${escA(subjM?subjM[1]:'Email')}</span></div><div class="apv-email-meta"><div><strong>From:</strong> ${escA(fromM?fromM[1]:'')}</div><div><strong>To:</strong> ${escA(toM?toM[1]:'')}</div><div><strong>Date:</strong> ${escA(dateM?dateM[1]:'')}</div>${attM?'<div><strong>Attachments:</strong> '+escA(attM[1])+'</div>':''}</div><div class="apv-email-body">${escA(body.slice(0,2000))}</div></div>`;
 }
 
 function renderCalcView(step){
@@ -1249,7 +1366,7 @@ function saveNote(){if(!selectedId)return;postMod(selectedId,{note:$('noteIn').v
 function postMod(id,d){fetch(`/api/moderate/${id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).catch(()=>{})}
 
 // ---- Settings ----
-let _loadedOpenaiKey='',_loadedAnthropicKey=''; // track masked values from server
+let _loadedOpenaiKey='',_loadedAnthropicKey='',_loadedEmailPassword=''; // track masked values from server
 function openSettings(){loadCfg();$('settingsModal').classList.add('open')}
 function closeSettings(){$('settingsModal').classList.remove('open')}
 function onProviderChange(){
@@ -1260,6 +1377,8 @@ function onProviderChange(){
   $('cfgOpenaiUrlRow').style.display=p==='openai'?'':'none';
   $('cfgAnthropicKeyRow').style.display=p==='anthropic'?'':'none';
   $('cfgOpenrouterRow').style.display=p==='openrouter'?'':'none';
+  // DSGVO warning
+  $('dsgvoSettingsWarn').style.display=p!=='ollama'?'':'none';
   // Update OpenAI OAuth status
   if(p==='openai'){
     const token=appCfg.openai_oauth_token||'';
@@ -1450,7 +1569,16 @@ async function loadCfg(){
     $('cfgAgentEnabled').checked=!!appCfg.agent_enabled;
     $('cfgAgentMaxSteps').value=appCfg.agent_max_steps||8;
     $('cfgAgentWebSearch').checked=appCfg.agent_web_search!==false;
+    // Email settings
+    $('cfgEmailEnabled').checked=!!appCfg.email_enabled;
+    $('cfgEmailImapServer').value=appCfg.email_imap_server||'outlook.office365.com';
+    $('cfgEmailImapPort').value=appCfg.email_imap_port||993;
+    $('cfgEmailAddress').value=appCfg.email_address||'';
+    _loadedEmailPassword=appCfg.email_password||'';
+    $('cfgEmailPassword').value=_loadedEmailPassword;
     onProviderChange();
+    // DSGVO chat banner
+    $('dsgvoChatBanner').style.display=appCfg._dsgvo_provider_block?'':'none';
     await loadModels();
     $('cfgModel').value=appCfg.default_model||'';
   }catch(e){}
@@ -1481,6 +1609,11 @@ async function saveSettings(){
     agent_enabled:$('cfgAgentEnabled').checked,
     agent_max_steps:parseInt($('cfgAgentMaxSteps').value)||8,
     agent_web_search:$('cfgAgentWebSearch').checked,
+    // Email settings
+    email_enabled:$('cfgEmailEnabled').checked,
+    email_imap_server:$('cfgEmailImapServer').value,
+    email_imap_port:parseInt($('cfgEmailImapPort').value)||993,
+    email_address:$('cfgEmailAddress').value,
   };
   // Only send API key if user changed it (not the masked value)
   const okey=$('cfgOpenaiKey').value;
@@ -1489,9 +1622,13 @@ async function saveSettings(){
   if(akey&&akey!==_loadedAnthropicKey)c.anthropic_api_key=akey;
   const dbpw=$('cfgDbMssqlPassword').value;
   if(dbpw&&dbpw!==_loadedDbPassword)c.db_mssql_password=dbpw;
+  const empw=$('cfgEmailPassword').value;
+  if(empw&&empw!==_loadedEmailPassword)c.email_password=empw;
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
   const d=await r.json();
   if(d.config)appCfg=d.config;
+  // Update DSGVO banner
+  $('dsgvoChatBanner').style.display=(appCfg._dsgvo_provider_block||appCfg.provider!=='ollama')?'':'none';
   closeSettings();
   // Reload models for possibly new provider
   await loadModels();
@@ -1525,6 +1662,18 @@ async function testDbConnection(){
     const r=await fetch('/api/db/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     const d=await r.json();
     if(d.ok){st.textContent='Connected! '+d.tables+' tables found.';st.style.color='var(--green)'}
+    else{st.textContent='Error: '+(d.error||'Unknown');st.style.color='var(--red)'}
+  }catch(e){st.textContent='Connection failed: '+e.message;st.style.color='var(--red)'}
+}
+
+async function testEmailConnection(){
+  const st=$('emailTestResult');st.textContent='Testing...';st.style.color='var(--text-dim)';
+  await saveSettings();
+  openSettings();
+  try{
+    const r=await fetch('/api/email/test',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(d.ok){st.textContent=d.message||'Connected!';st.style.color='var(--green)'}
     else{st.textContent='Error: '+(d.error||'Unknown');st.style.color='var(--red)'}
   }catch(e){st.textContent='Connection failed: '+e.message;st.style.color='var(--red)'}
 }

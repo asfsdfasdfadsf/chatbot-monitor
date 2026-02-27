@@ -1,6 +1,6 @@
 # WaWi Chatbot Admin Monitor
 
-Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL queries, errors, moderation, user management, authentication, database connectivity, and RAG knowledge base.
+Live admin dashboard for monitoring your WaWi chatbot — conversations, SQL queries, errors, moderation, user management, authentication, database connectivity, RAG knowledge base, email integration, and DSGVO-compliant provider management.
 
 ## Architecture
 
@@ -16,6 +16,7 @@ Users → Web Chat → FastAPI Chatbot → LLM Provider
                   ↓                      • OpenRouter (OAuth, 200+ models)
             Database (MSSQL / SQLite)
             Knowledge Base (RAG embeddings)
+            Email (IMAP, e.g. M365)
             Event Buffer (deque, indexed by user)
 ```
 
@@ -42,12 +43,14 @@ The server is optimized for production use:
 ## Features
 
 - **Multi-provider LLM** — switch between Ollama (local), OpenAI (ChatGPT), Anthropic (Claude), and OpenRouter (200+ models via OAuth)
-- **Agent Mode** — LLM autonomously calls tools (DB queries, RAG search, web search, calculator, datetime, schema listing) in a loop until it has enough info to answer
+- **Agent Mode** — LLM autonomously calls tools (DB queries, RAG search, web search, email search, calculator, datetime, schema listing) in a loop until it has enough info to answer
 - **OpenAI OAuth PKCE** — login with your ChatGPT account (Plus/Pro) instead of API keys
 - **Chat memory** — session-based conversation history (max 20 messages per session)
-- **Chat file upload** — attach .txt, .md, .csv, .json, .xlsx files directly in chat for analysis
+- **Chat file upload** — attach files directly in chat for analysis (PDF, DOCX, Excel, and 28 plaintext formats)
+- **DSGVO provider lock** — automatically blocks database, knowledge base, and email access when using online providers (OpenAI, Anthropic, OpenRouter); only Ollama (local) gets full access
+- **Email integration** — IMAP read access for company email (e.g. M365 outlook.office365.com); agent can search and read emails
 - **Database connectivity** — connect to MSSQL (JTL-WaWi) or SQLite databases for NL-to-SQL queries
-- **Knowledge Base (RAG)** — upload documents (.txt, .md, .csv, .xlsx), auto-chunk and embed, cosine similarity search injected into chat context
+- **Knowledge Base (RAG)** — upload documents (.txt, .md, .csv, .xlsx, .pdf, .docx, and more), auto-chunk and embed, cosine similarity search injected into chat context
 - **Live event feed** — chat, query, error, and system events in real-time via SSE
 - **SQL inspector** — syntax-highlighted queries with result tables, admin can run raw SQL
 - **Moderation** — flag, review, and annotate chat events
@@ -58,7 +61,7 @@ The server is optimized for production use:
 - **Bot kill switch** — admin can globally disable the bot with one toggle
 - **German by default** — AI responds in German unless the user writes in another language
 - **Python SDK** — fire-and-forget logging, Ollama wrapper, DB wrapper, FastAPI middleware
-- **Zero core dependencies** — pure Python stdlib server, optional `pyodbc` for MSSQL, `openpyxl` for Excel
+- **Zero core dependencies** — pure Python stdlib server, optional `pyodbc` for MSSQL, `openpyxl` for Excel, `PyPDF2` for PDF, `python-docx` for DOCX
 
 ## Quick Start
 
@@ -79,11 +82,13 @@ Change this password or create a new admin account after first login.
 ### 2. Optional dependencies
 
 ```bash
-pip install pyodbc     # For MSSQL database connections
-pip install openpyxl   # For Excel file uploads (.xlsx)
+pip install pyodbc      # For MSSQL database connections
+pip install openpyxl    # For Excel file uploads (.xlsx)
+pip install PyPDF2      # For PDF file uploads (.pdf)
+pip install python-docx # For DOCX file uploads (.docx)
 ```
 
-Both are optional — the server runs without them but the respective features will be unavailable.
+All are optional — the server runs without them but the respective features will be unavailable.
 
 ### 3. Connect your chatbot (pick your style)
 
@@ -262,6 +267,11 @@ Upload documents that get chunked, embedded, and used as context for all convers
 | `.csv` | Comma-separated values |
 | `.json` | JSON data |
 | `.xlsx` / `.xls` | Excel spreadsheets (requires `openpyxl`) |
+| `.pdf` | PDF documents (requires `PyPDF2`) |
+| `.docx` | Word documents (requires `python-docx`) |
+| `.xml`, `.html`, `.yaml`, `.yml` | Markup/config files |
+| `.py`, `.js`, `.ts`, `.java`, `.cs`, `.cpp`, `.c`, `.h`, `.sh`, `.bat`, `.ps1` | Source code |
+| `.ini`, `.cfg`, `.properties`, `.toml`, `.sql`, `.log` | Config/log files |
 
 ### How It Works
 
@@ -289,6 +299,33 @@ The Knowledge tab (right panel) shows:
 - Search test to verify RAG retrieval
 - Stats (total documents, chunks, DB size)
 
+## Email Integration (IMAP)
+
+Read-only access to a company email inbox via IMAP. The agent can search and read emails to answer questions about correspondence, orders, or support tickets.
+
+### Setup
+
+1. Go to **Settings** → **Email (IMAP)** section
+2. Enter IMAP server (default: `outlook.office365.com`), port (default: `993`), email address, and password
+3. Click **Test Connection** to verify
+4. Check **Enable Email Access**
+5. Save
+
+### DSGVO Note
+
+Email access is **only available with Ollama** (local provider). When using OpenAI, Anthropic, or OpenRouter, email tools are automatically disabled to prevent company emails from being sent to external servers.
+
+### Agent Tools
+
+- `search_emails` — search by sender, subject, or full-text content; returns UID, from, subject, date
+- `read_email` — fetch full email body and attachment list by UID
+
+### Agent Viewer
+
+The agent panel shows email results with a dedicated inbox-style viewer:
+- **Search view**: list of matching emails with sender, subject, and date
+- **Read view**: full email with headers, body text, and attachment list
+
 ## Agent Mode
 
 When enabled, the LLM can autonomously call tools in a loop (up to N steps) to gather information before answering. This replaces the simple NL-to-SQL two-pass approach with a proper tool-calling agent.
@@ -303,6 +340,8 @@ When enabled, the LLM can autonomously call tools in a loop (up to N steps) to g
 | `calculate` | Safe math expression evaluator | All users | Always available |
 | `get_datetime` | Get current date and time | All users | Always available |
 | `list_tables` | List database tables and columns | Admin/Mitarbeiter | DB enabled |
+| `search_emails` | Search company email inbox by sender/subject/content | Admin/Mitarbeiter | Email enabled |
+| `read_email` | Read a specific email by UID | Admin/Mitarbeiter | Email enabled |
 
 ### How It Works
 
@@ -326,9 +365,12 @@ The agent supports **native function calling** for providers that support it (Op
 
 ### DSGVO / Permission Model
 
-- **Admin/Mitarbeiter**: Access to all tools including database and knowledge base
+- **Ollama (local)**: All tools available — data stays on your machine
+- **Online providers** (OpenAI, Anthropic, OpenRouter): Database, knowledge base, and email tools are **automatically blocked** to prevent sensitive company data from being sent to external servers
+- **Admin/Mitarbeiter** (on Ollama): Access to all tools including database, knowledge base, and email
 - **Regular users**: Only non-privileged tools (calculator, datetime, web search)
-- Tools are filtered based on the user's role and which features are enabled in config
+- Tools are filtered based on the user's role, provider type, and which features are enabled in config
+- A yellow DSGVO warning banner appears in the chat and settings when an online provider is active
 
 ### Tool Log in Chat
 
@@ -348,7 +390,7 @@ Per-session message history (max 20 messages). Conversations persist across page
 
 ### File Upload
 
-Click the paperclip icon to attach a file directly in the chat. The file content is extracted and sent alongside your question for analysis. Supports .txt, .md, .csv, .json, .log, .xlsx, .xls.
+Click the paperclip icon to attach a file directly in the chat. The file content is extracted and sent alongside your question for analysis. Supports PDF, DOCX, Excel, and 28 plaintext formats (.txt, .md, .csv, .json, .py, .xml, .html, .yaml, .sql, etc.).
 
 ### German Default
 
@@ -517,6 +559,7 @@ Right panel tabs: **Users | Stats | Accounts | Knowledge**
 | POST | `/api/accounts/<name>/role` | Change account role |
 | POST | `/api/accounts/<name>/priority` | Change account priority |
 | POST | `/api/accounts/<name>/delete` | Delete a dashboard account |
+| POST | `/api/email/test` | Test IMAP email connection |
 | POST | `/api/db/test` | Test database connection |
 | GET | `/api/db/schema` | Get database schema |
 | POST | `/api/db/query` | Execute raw SQL query |
@@ -578,6 +621,11 @@ Default: everything on localhost, zero config needed.
 | Agent mode | `false` | Dashboard settings |
 | Agent max steps | `8` | Dashboard settings (1–20) |
 | Agent web search | `true` | Dashboard settings |
+| Email enabled | `false` | Dashboard settings |
+| Email IMAP server | `outlook.office365.com` | Dashboard settings |
+| Email IMAP port | `993` | Dashboard settings |
+| Email address | (empty) | Dashboard settings |
+| Email password | (empty) | Dashboard settings (masked in API) |
 | Max events | 5000 | `MAX_EVENTS` in `server.py` |
 | Session TTL | 24 hours | `SESSION_TTL` in `server.py` |
 

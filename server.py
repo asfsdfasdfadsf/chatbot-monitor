@@ -12,6 +12,7 @@ import ast
 import base64
 import json
 import hashlib
+import socket
 import math
 import os
 import re
@@ -31,6 +32,10 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from pathlib import Path
+import imaplib
+import email as email_lib
+from email.header import decode_header as email_decode_header
+from email.utils import parsedate_to_datetime
 import sqlite3  # always available
 
 try:
@@ -56,6 +61,27 @@ try:
     HAS_TIKTOKEN = True
 except ImportError:
     HAS_TIKTOKEN = False
+
+try:
+    import PyPDF2
+    HAS_PYPDF2 = True
+except ImportError:
+    HAS_PYPDF2 = False
+
+try:
+    import docx  # python-docx
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+PLAIN_TEXT_EXTENSIONS = frozenset((
+    ".txt", ".md", ".csv", ".json", ".log",
+    ".xml", ".html", ".htm", ".yaml", ".yml",
+    ".ini", ".cfg", ".properties", ".sql",
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".cs", ".cpp", ".c", ".h",
+    ".sh", ".bat", ".ps1", ".toml",
+))
 
 # ---------------------------------------------------------------------------
 # OpenAI OAuth PKCE constants (from Codex CLI)
@@ -109,6 +135,11 @@ config = {
     "agent_enabled": False,
     "agent_max_steps": 8,
     "agent_web_search": True,
+    "email_enabled": False,
+    "email_imap_server": "outlook.office365.com",
+    "email_imap_port": 993,
+    "email_address": "",
+    "email_password": "",
 }
 config_lock = threading.Lock()
 
@@ -266,7 +297,6 @@ def load_accounts():
 
 def save_accounts():
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
         with accounts_lock:
             with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
                 json.dump(accounts, f, ensure_ascii=False, indent=2)
@@ -379,6 +409,26 @@ def append_chat_message(session_id: str, role: str, content: str, username: str 
                 chat_session_meta[session_id]["username"] = username
             if model:
                 chat_session_meta[session_id]["model"] = model
+
+
+def append_and_get_history(session_id: str, role: str, content: str, username: str = "", model: str = "") -> list[dict]:
+    """Append a message and return the full history in one lock acquisition."""
+    now = time.time()
+    with chat_sessions_lock:
+        if session_id not in chat_sessions:
+            chat_sessions[session_id] = []
+        chat_sessions[session_id].append({"role": role, "content": content, "timestamp": now})
+        if len(chat_sessions[session_id]) > MAX_CHAT_HISTORY:
+            chat_sessions[session_id] = chat_sessions[session_id][-MAX_CHAT_HISTORY:]
+        if session_id not in chat_session_meta:
+            chat_session_meta[session_id] = {"username": username, "created_at": now, "last_activity": now, "model": model}
+        else:
+            chat_session_meta[session_id]["last_activity"] = now
+            if username:
+                chat_session_meta[session_id]["username"] = username
+            if model:
+                chat_session_meta[session_id]["model"] = model
+        return list(chat_sessions[session_id])
 
 
 def clear_chat_history(session_id: str):
@@ -590,7 +640,6 @@ def load_config():
 
 def save_config():
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -612,7 +661,6 @@ def load_users():
 
 def save_users():
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
         with users_lock:
             with open(USERS_FILE, "w", encoding="utf-8") as f:
                 json.dump(users, f, ensure_ascii=False, indent=2)
@@ -725,13 +773,42 @@ def rebuild_users_from_events():
                 increment_user_stat(uid, "error_count")
 
 
+_event_write_queue: queue.Queue = queue.Queue()
+
+
 def append_event_to_file(evt: dict):
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(evt, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[persist] Error writing event: {e}", file=sys.stderr)
+    """Queue event for async disk write (non-blocking)."""
+    _event_write_queue.put(evt)
+
+
+def _event_writer_loop():
+    """Background thread: batch-write queued events to disk."""
+    _write_counter = 0
+    while True:
+        batch = []
+        try:
+            batch.append(_event_write_queue.get(timeout=1.0))
+        except queue.Empty:
+            continue
+        # Drain up to 49 more (batch of 50 max)
+        while len(batch) < 50:
+            try:
+                batch.append(_event_write_queue.get_nowait())
+            except queue.Empty:
+                break
+        try:
+            with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+                for evt in batch:
+                    f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[persist] Error writing events: {e}", file=sys.stderr)
+        _write_counter += len(batch)
+        if _write_counter >= 10:
+            save_users()
+            _write_counter = 0
+
+
+threading.Thread(target=_event_writer_loop, daemon=True).start()
 
 
 _moderation_save_pending = False
@@ -757,7 +834,6 @@ def persist_moderation(event_id: str, mod: dict):
         global _moderation_save_pending
         time.sleep(2)  # batch writes within 2 seconds
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
             with events_lock:
                 snapshot = list(events)
             with open(EVENTS_FILE, "w", encoding="utf-8") as f:
@@ -781,7 +857,6 @@ def clear_all_events():
     with moderation_lock:
         moderation = {}
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(EVENTS_FILE, "w", encoding="utf-8") as f:
             pass
     except Exception:
@@ -829,10 +904,6 @@ def ingest_event(evt: dict) -> dict:
     append_event_to_file(evt)
     broadcast_event(evt)
 
-    # Save users periodically (every 10th event to avoid thrashing)
-    if len(events) % 10 == 0:
-        save_users()
-
     return evt
 
 
@@ -853,7 +924,7 @@ def call_ollama(messages: list[dict], model: str, temperature: float) -> tuple[s
         f"{ollama_url}/api/chat", data=data,
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    resp = urlopen(req, timeout=600)
+    resp = urlopen(req, timeout=120)
     result = json.loads(resp.read())
     answer = result.get("message", {}).get("content", "")
     # Ollama returns eval_count (output tokens) and prompt_eval_count (input tokens)
@@ -1236,6 +1307,293 @@ def call_llm(messages: list[dict], model: str, temperature: float) -> tuple[str,
 
 
 # ---------------------------------------------------------------------------
+# Streaming LLM providers (yield token strings, final yield is a metadata dict)
+# ---------------------------------------------------------------------------
+def call_ollama_stream(messages: list[dict], model: str, temperature: float):
+    """Generator: yields token strings, then a final dict with done/duration_ms/token_usage."""
+    with config_lock:
+        ollama_url = config["ollama_url"]
+
+    body: dict = {"model": model, "messages": messages, "stream": True}
+    if temperature is not None:
+        body["options"] = {"temperature": temperature}
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        f"{ollama_url}/api/chat", data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            chunk = json.loads(line)
+            if chunk.get("done"):
+                token_usage["prompt_tokens"] = chunk.get("prompt_eval_count", 0)
+                token_usage["completion_tokens"] = chunk.get("eval_count", 0)
+                token_usage["total_tokens"] = token_usage["prompt_tokens"] + token_usage["completion_tokens"]
+                break
+            content = chunk.get("message", {}).get("content", "")
+            if content:
+                yield content
+        except json.JSONDecodeError:
+            continue
+    duration_ms = round((time.time() - start) * 1000, 1)
+    yield {"done": True, "duration_ms": duration_ms, "token_usage": token_usage}
+
+
+def call_openai_stream(messages: list[dict], model: str, temperature: float):
+    """Generator: yields token strings, then a final dict with done/duration_ms/token_usage."""
+    with config_lock:
+        base_url = config.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+
+    bearer = get_openai_bearer_token()
+    if not bearer:
+        raise ValueError("OpenAI API key not configured — use Login with OpenAI or set an API key in Settings")
+
+    use_oauth = _using_oauth_token()
+    start = time.time()
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    if use_oauth:
+        # ChatGPT backend — stream via Responses API
+        if not model:
+            model = CHATGPT_DEFAULT_MODEL
+        system_text = ""
+        input_parts = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text = m["content"]
+            else:
+                input_parts.append(m)
+
+        body = {"model": model, "store": False, "stream": True}
+        body["instructions"] = system_text or "You are a helpful assistant. Antworte auf Deutsch."
+        body["input"] = [
+            {"role": m["role"], "type": "message",
+             "content": [{"type": "output_text" if m["role"] == "assistant" else "input_text", "text": m["content"]}]}
+            for m in input_parts
+        ]
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"}
+        account_id = _get_chatgpt_account_id()
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+        req = Request(f"{CHATGPT_BACKEND_URL}/responses", data=data, headers=headers, method="POST")
+        resp = urlopen(req, timeout=120)
+
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                break
+            try:
+                evt = json.loads(payload)
+                evt_type = evt.get("type", "")
+                if evt_type == "response.output_text.delta":
+                    delta = evt.get("delta", "")
+                    if delta:
+                        yield delta
+                elif evt_type == "response.completed":
+                    resp_obj = evt.get("response", {})
+                    usage = resp_obj.get("usage", {})
+                    token_usage["prompt_tokens"] = usage.get("input_tokens", 0)
+                    token_usage["completion_tokens"] = usage.get("output_tokens", 0)
+                    token_usage["total_tokens"] = usage.get("total_tokens",
+                                                             token_usage["prompt_tokens"] + token_usage["completion_tokens"])
+                elif evt_type == "error":
+                    err_msg = evt.get("message", "") or evt.get("error", {}).get("message", "")
+                    raise ValueError(f"Stream error: {err_msg}")
+            except json.JSONDecodeError:
+                continue
+    else:
+        # API key — stream via Chat Completions
+        if not model:
+            model = "gpt-4o-mini"
+        body = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
+        if temperature is not None:
+            body["temperature"] = temperature
+        data = json.dumps(body).encode("utf-8")
+        req = Request(
+            f"{base_url}/chat/completions", data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {bearer}"},
+            method="POST",
+        )
+        resp = urlopen(req, timeout=120)
+
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                usage = chunk.get("usage")
+                if usage:
+                    token_usage["prompt_tokens"] = usage.get("prompt_tokens", 0)
+                    token_usage["completion_tokens"] = usage.get("completion_tokens", 0)
+                    token_usage["total_tokens"] = usage.get("total_tokens", 0)
+            except json.JSONDecodeError:
+                continue
+
+    duration_ms = round((time.time() - start) * 1000, 1)
+    yield {"done": True, "duration_ms": duration_ms, "token_usage": token_usage}
+
+
+def call_anthropic_stream(messages: list[dict], model: str, temperature: float):
+    """Generator: yields token strings, then a final dict with done/duration_ms/token_usage."""
+    with config_lock:
+        api_key = config["anthropic_api_key"]
+
+    if not api_key:
+        raise ValueError("Anthropic API key not configured")
+
+    system_prompt = ""
+    chat_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_prompt = m["content"]
+        else:
+            chat_messages.append(m)
+
+    body: dict = {"model": model, "max_tokens": 4096, "messages": chat_messages, "stream": True}
+    if system_prompt:
+        body["system"] = system_prompt
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        "https://api.anthropic.com/v1/messages", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            break
+        try:
+            evt = json.loads(payload)
+            evt_type = evt.get("type", "")
+            if evt_type == "content_block_delta":
+                delta = evt.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        yield text
+            elif evt_type == "message_start":
+                msg = evt.get("message", {})
+                usage = msg.get("usage", {})
+                if usage:
+                    token_usage["prompt_tokens"] = usage.get("input_tokens", 0)
+            elif evt_type == "message_delta":
+                usage = evt.get("usage", {})
+                if usage:
+                    token_usage["completion_tokens"] = usage.get("output_tokens", 0)
+                    token_usage["total_tokens"] = token_usage["prompt_tokens"] + token_usage["completion_tokens"]
+        except json.JSONDecodeError:
+            continue
+
+    if not token_usage["total_tokens"]:
+        token_usage["total_tokens"] = token_usage["prompt_tokens"] + token_usage["completion_tokens"]
+    duration_ms = round((time.time() - start) * 1000, 1)
+    yield {"done": True, "duration_ms": duration_ms, "token_usage": token_usage}
+
+
+def call_openrouter_stream(messages: list[dict], model: str, temperature: float):
+    """Generator: yields token strings, then a final dict with done/duration_ms/token_usage."""
+    with config_lock:
+        api_key = config["openrouter_api_key"]
+
+    if not api_key:
+        raise ValueError("OpenRouter API key not configured — use Login with OpenRouter in Settings")
+
+    body = {"model": model, "messages": messages, "stream": True}
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    start = time.time()
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "http://localhost:7779",
+            "X-Title": "WaWi Chatbot Monitor",
+        },
+        method="POST",
+    )
+    resp = urlopen(req, timeout=120)
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+            choices = chunk.get("choices", [])
+            if choices:
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    yield content
+            usage = chunk.get("usage")
+            if usage:
+                token_usage["prompt_tokens"] = usage.get("prompt_tokens", 0)
+                token_usage["completion_tokens"] = usage.get("completion_tokens", 0)
+                token_usage["total_tokens"] = usage.get("total_tokens", 0)
+        except json.JSONDecodeError:
+            continue
+
+    duration_ms = round((time.time() - start) * 1000, 1)
+    yield {"done": True, "duration_ms": duration_ms, "token_usage": token_usage}
+
+
+def call_llm_stream(messages: list[dict], model: str, temperature: float):
+    """Dispatch to the configured streaming LLM provider. Yields token strings, then a final metadata dict."""
+    with config_lock:
+        provider = config.get("provider", "ollama")
+    if provider == "openai":
+        yield from call_openai_stream(messages, model, temperature)
+    elif provider == "anthropic":
+        yield from call_anthropic_stream(messages, model, temperature)
+    elif provider == "openrouter":
+        yield from call_openrouter_stream(messages, model, temperature)
+    else:
+        yield from call_ollama_stream(messages, model, temperature)
+
+
+# ---------------------------------------------------------------------------
 # Token usage tracking
 # ---------------------------------------------------------------------------
 _token_usage_lock = threading.Lock()
@@ -1347,14 +1705,47 @@ AGENT_TOOLS = [
         },
         "privileged": True,
         "requires": "db_enabled"
+    },
+    {
+        "name": "search_emails",
+        "description": "Search the company email inbox. Use this to find emails by sender, subject, or content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Full-text search query (searches email body)"},
+                "sender": {"type": "string", "description": "Filter by sender email address or name"},
+                "subject": {"type": "string", "description": "Filter by subject line"},
+                "max_results": {"type": "integer", "description": "Max emails to return (default 10)"}
+            }
+        },
+        "privileged": True,
+        "requires": "email_enabled"
+    },
+    {
+        "name": "read_email",
+        "description": "Read a specific email by its UID. Use after search_emails to get the full email body.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "uid": {"type": "string", "description": "The email UID from search_emails results"}
+            },
+            "required": ["uid"]
+        },
+        "privileged": True,
+        "requires": "email_enabled"
     }
 ]
 
 
-def _get_available_tools(role: str) -> list:
+def _get_available_tools(role: str, dsgvo_provider_block: bool = False) -> list:
     """Filter AGENT_TOOLS based on user role and enabled features."""
     with config_lock:
         cfg_snapshot = dict(config)
+    # DSGVO: override sensitive features when using online providers
+    if dsgvo_provider_block:
+        cfg_snapshot["db_enabled"] = False
+        cfg_snapshot["rag_enabled"] = False
+        cfg_snapshot["email_enabled"] = False
     tools = []
     for t in AGENT_TOOLS:
         # Check if required feature is enabled
@@ -1411,6 +1802,35 @@ def _execute_tool(name: str, arguments: dict) -> str:
         elif name == "list_tables":
             schema = get_db_schema()
             return schema if schema else "No database schema available."
+
+        elif name == "search_emails":
+            query = arguments.get("query", "")
+            sender = arguments.get("sender", "")
+            subject = arguments.get("subject", "")
+            max_results = int(arguments.get("max_results", 10))
+            results = search_emails_imap(query, sender, subject, max_results)
+            if not results:
+                return "No emails found matching your search."
+            parts = []
+            for r in results:
+                parts.append(f"UID: {r['uid']} | From: {r['from']} | Subject: {r['subject']} | Date: {r['date']}")
+            return f"{len(results)} emails found:\n\n" + "\n".join(parts)
+
+        elif name == "read_email":
+            uid = arguments.get("uid", "")
+            result = read_email_imap(uid)
+            if result.get("error"):
+                return f"Error: {result['error']}"
+            parts = [
+                f"From: {result['from']}",
+                f"To: {result['to']}",
+                f"Subject: {result['subject']}",
+                f"Date: {result['date']}",
+            ]
+            if result.get("attachments"):
+                parts.append(f"Attachments: {', '.join(result['attachments'])}")
+            parts.append(f"\n{result['body']}")
+            return "\n".join(parts)
 
         else:
             return f"Unknown tool: {name}"
@@ -2223,6 +2643,171 @@ def execute_db_query(sql: str, params=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Email IMAP
+# ---------------------------------------------------------------------------
+_imap_local = threading.local()
+
+
+def _decode_email_header(raw):
+    """Decode an RFC2047 email header value to a plain string."""
+    if not raw:
+        return ""
+    parts = email_decode_header(raw)
+    decoded = []
+    for data, charset in parts:
+        if isinstance(data, bytes):
+            decoded.append(data.decode(charset or "utf-8", errors="replace"))
+        else:
+            decoded.append(str(data))
+    return " ".join(decoded)
+
+
+def _get_email_body(msg):
+    """Extract plain-text body from an email message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/plain" and part.get("Content-Disposition") != "attachment":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="replace")
+        # Fallback to text/html if no plain text
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/html" and part.get("Content-Disposition") != "attachment":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    html = payload.decode(charset, errors="replace")
+                    # Strip HTML tags for plain text
+                    return re.sub(r"<[^>]+>", "", html).strip()
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="replace")
+    return ""
+
+
+def get_imap_connection():
+    """Get or create a thread-local IMAP connection."""
+    with config_lock:
+        server = config.get("email_imap_server", "")
+        port = config.get("email_imap_port", 993)
+        address = config.get("email_address", "")
+        password = config.get("email_password", "")
+    if not server or not address or not password:
+        return None
+
+    conn = getattr(_imap_local, "conn", None)
+    if conn:
+        try:
+            conn.noop()
+            return conn
+        except Exception:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+            _imap_local.conn = None
+
+    try:
+        conn = imaplib.IMAP4_SSL(server, port)
+        conn.login(address, password)
+        _imap_local.conn = conn
+        return conn
+    except Exception as e:
+        print(f"[email] IMAP connection failed: {e}", file=sys.stderr)
+        return None
+
+
+def search_emails_imap(query: str = "", sender: str = "", subject: str = "", max_results: int = 10) -> list:
+    """Search emails via IMAP SEARCH. Returns list of dicts with uid, from, subject, date, snippet."""
+    conn = get_imap_connection()
+    if not conn:
+        return []
+    try:
+        conn.select("INBOX", readonly=True)
+        # Build IMAP search criteria
+        criteria = []
+        if sender:
+            criteria.append(f'FROM "{sender}"')
+        if subject:
+            criteria.append(f'SUBJECT "{subject}"')
+        if query:
+            criteria.append(f'TEXT "{query}"')
+        if not criteria:
+            criteria.append("ALL")
+
+        search_str = " ".join(criteria)
+        status, data = conn.search(None, f"({search_str})")
+        if status != "OK" or not data[0]:
+            return []
+
+        msg_nums = data[0].split()
+        # Take last N (newest)
+        msg_nums = msg_nums[-max_results:]
+        msg_nums.reverse()
+
+        results = []
+        for num in msg_nums:
+            status, header_data = conn.fetch(num, "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+            if status != "OK":
+                continue
+            raw = header_data[0][1]
+            msg = email_lib.message_from_bytes(raw)
+            # Get UID
+            uid_match = re.search(rb"UID (\d+)", header_data[0][0])
+            uid = uid_match.group(1).decode() if uid_match else num.decode()
+
+            results.append({
+                "uid": uid,
+                "from": _decode_email_header(msg.get("From", "")),
+                "subject": _decode_email_header(msg.get("Subject", "")),
+                "date": msg.get("Date", ""),
+            })
+        return results
+    except Exception as e:
+        print(f"[email] Search error: {e}", file=sys.stderr)
+        return []
+
+
+def read_email_imap(uid: str) -> dict:
+    """Fetch a single email by UID. Returns dict with from, to, subject, date, body, attachments."""
+    conn = get_imap_connection()
+    if not conn:
+        return {"error": "IMAP not connected"}
+    try:
+        conn.select("INBOX", readonly=True)
+        status, data = conn.uid("fetch", uid, "(RFC822)")
+        if status != "OK" or not data[0]:
+            return {"error": f"Email UID {uid} not found"}
+        raw = data[0][1]
+        msg = email_lib.message_from_bytes(raw)
+        body = _get_email_body(msg)
+        attachments = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                disp = str(part.get("Content-Disposition", ""))
+                if "attachment" in disp:
+                    fname = part.get_filename()
+                    if fname:
+                        attachments.append(_decode_email_header(fname))
+        return {
+            "uid": uid,
+            "from": _decode_email_header(msg.get("From", "")),
+            "to": _decode_email_header(msg.get("To", "")),
+            "subject": _decode_email_header(msg.get("Subject", "")),
+            "date": msg.get("Date", ""),
+            "body": body[:5000],
+            "attachments": attachments,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Embedding store
 # ---------------------------------------------------------------------------
 EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
@@ -2230,7 +2815,6 @@ EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
 
 def init_embedding_db():
     """Create embedding tables if they don't exist."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(EMBEDDINGS_DB))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS documents (
@@ -2342,6 +2926,32 @@ def parse_excel(file_bytes: bytes) -> str:
             parts.append("\n".join(lines))
     wb.close()
     return "\n\n".join(parts)
+
+
+def parse_pdf(file_bytes: bytes) -> str:
+    """Parse a PDF file and return its text content."""
+    if not HAS_PYPDF2:
+        raise ImportError("PyPDF2 is not installed. Run: pip install PyPDF2")
+    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+    parts = []
+    for i, page in enumerate(reader.pages, 1):
+        text = page.extract_text()
+        if text and text.strip():
+            parts.append(f"## Seite {i}\n{text.strip()}")
+    return "\n\n".join(parts) if parts else "(PDF enthält keinen extrahierbaren Text)"
+
+
+def parse_docx(file_bytes: bytes) -> str:
+    """Parse a DOCX file and return its text content."""
+    if not HAS_DOCX:
+        raise ImportError("python-docx is not installed. Run: pip install python-docx")
+    doc = docx.Document(io.BytesIO(file_bytes))
+    parts = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts) if parts else "(DOCX enthält keinen Text)"
 
 
 def chunk_tabular_text(text: str, chunk_size: int = 500) -> list:
@@ -2894,6 +3504,13 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 return
             return self._handle_user_action(path)
 
+        # Email endpoints (admin-only)
+        if path == "/api/email/test":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_email_test()
+
         # Database endpoints (admin-only)
         if path == "/api/db/test":
             session = self._require_auth("admin")
@@ -3081,14 +3698,28 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not filename:
                 filename = "upload.txt"
 
-            # Parse file content
-            if filename.lower().endswith((".xlsx", ".xls")):
+            # Parse file content based on extension
+            ext = os.path.splitext(filename.lower())[1]
+            if ext in (".xlsx", ".xls"):
                 if not HAS_OPENPYXL:
-                    self._send_json({"error": "Excel not supported (openpyxl missing)"}, 400)
+                    self._send_json({"error": "Excel not supported (openpyxl missing). Run: pip install openpyxl"}, 400)
                     return
                 text = parse_excel(file_bytes)
-            else:
+            elif ext == ".pdf":
+                if not HAS_PYPDF2:
+                    self._send_json({"error": "PDF not supported (PyPDF2 missing). Run: pip install PyPDF2"}, 400)
+                    return
+                text = parse_pdf(file_bytes)
+            elif ext == ".docx":
+                if not HAS_DOCX:
+                    self._send_json({"error": "DOCX not supported (python-docx missing). Run: pip install python-docx"}, 400)
+                    return
+                text = parse_docx(file_bytes)
+            elif ext in PLAIN_TEXT_EXTENSIONS:
                 text = file_bytes.decode("utf-8", errors="replace")
+            else:
+                self._send_json({"error": f"Unsupported file type: {ext}"}, 400)
+                return
 
             # Truncate if too large (max ~8000 tokens ≈ 32000 chars)
             max_chars = 32000
@@ -3353,11 +3984,23 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             db_enabled = False
             rag_enabled = False
 
+        # DSGVO: Block sensitive data tools when using online providers
+        with config_lock:
+            dsgvo_provider_block = config.get("provider", "ollama") != "ollama"
+            email_enabled = config.get("email_enabled", False)
+
+        if dsgvo_provider_block:
+            db_enabled = False
+            rag_enabled = False
+            email_enabled = False
+        elif user_role not in ("admin", "mitarbeiter"):
+            email_enabled = False
+
         # Get session ID for chat history
         _, sid = self._get_session()
 
-        # Append user message to session history
-        append_chat_message(sid, "user", question, username=user_id, model=model)
+        # Append user message and get full history in one lock
+        chat_history = append_and_get_history(sid, "user", question, username=user_id, model=model)
 
         # Build system prompt with optional DB schema and RAG context
         system_parts = []
@@ -3400,7 +4043,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         messages = []
         if system_parts:
             messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-        messages.extend(get_chat_history(sid))
+        messages.extend(chat_history)
 
         total_start = time.time()
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -3412,7 +4055,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             agent_max_steps = config.get("agent_max_steps", 8)
 
         if agent_enabled:
-            available_tools = _get_available_tools(user_role)
+            available_tools = _get_available_tools(user_role, dsgvo_provider_block=dsgvo_provider_block)
             if available_tools:
                 # Add agent instruction to system prompt
                 agent_sys = (
@@ -3467,6 +4110,62 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     resp["tool_log"] = tool_log
                 self._send_json(resp)
                 return
+
+        # --- Streaming path (non-agent, non-DB) ---
+        qs = parse_qs(urlparse(self.path).query)
+        want_stream = qs.get("stream", ["0"])[0] == "1"
+
+        if want_stream and not agent_enabled and not db_enabled:
+            try:
+                # Build raw HTTP response header — bypass BufferedWriter for true streaming
+                header = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream\r\n"
+                    "Cache-Control: no-cache\r\n"
+                    "Connection: keep-alive\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "\r\n"
+                )
+                self.request.sendall(header.encode("utf-8"))
+
+                def _sse_send(obj):
+                    self.request.sendall(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+                full_answer = ""
+                stream_usage = {}
+                for chunk in call_llm_stream(messages, model, temperature):
+                    if isinstance(chunk, dict):
+                        stream_usage = chunk.get("token_usage", {})
+                        break
+                    full_answer += chunk
+                    _sse_send({"token": chunk})
+
+                total_ms = round((time.time() - total_start) * 1000, 1)
+                for k in total_usage:
+                    total_usage[k] += stream_usage.get(k, 0)
+                track_token_usage(user_id, total_usage)
+                append_chat_message(sid, "assistant", full_answer, username=user_id, model=model)
+
+                done_data = {"done": True, "answer": full_answer, "duration_ms": total_ms, "model": model}
+                if total_usage.get("total_tokens"):
+                    done_data["token_usage"] = total_usage
+                _sse_send(done_data)
+
+                ingest_event({
+                    "type": "chat", "user_id": user_id, "question": question,
+                    "answer": full_answer, "duration_ms": total_ms, "model": model,
+                    **({"token_usage": total_usage} if total_usage.get("total_tokens") else {}),
+                })
+            except Exception as e:
+                try:
+                    self.request.sendall(("data: " + json.dumps({"error": str(e)}) + "\n\n").encode("utf-8"))
+                except Exception:
+                    pass
+                ingest_event({
+                    "type": "error", "message": str(e),
+                    "error_type": "llm_stream_error", "user_id": user_id,
+                })
+            return
 
         # --- Standard (non-agent) path ---
         try:
@@ -3612,6 +4311,16 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 config["agent_web_search"] = bool(data["agent_web_search"])
             if "agent_max_steps" in data:
                 config["agent_max_steps"] = max(1, min(20, int(data["agent_max_steps"])))
+            # Email config keys
+            if "email_enabled" in data:
+                config["email_enabled"] = bool(data["email_enabled"])
+            for key in ("email_imap_server", "email_address"):
+                if key in data:
+                    config[key] = data[key]
+            if "email_imap_port" in data:
+                config["email_imap_port"] = int(data["email_imap_port"])
+            if "email_password" in data and not str(data["email_password"]).startswith("..."):
+                config["email_password"] = data["email_password"]
         # Refresh schema cache if DB config changed
         if db_config_changed:
             with config_lock:
@@ -4127,12 +4836,15 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             cfg = dict(config)
         # Mask API keys and tokens — show only last 4 chars
         for key in ("openai_api_key", "anthropic_api_key", "openrouter_api_key",
-                     "openai_oauth_token", "openai_refresh_token", "db_mssql_password"):
+                     "openai_oauth_token", "openai_refresh_token", "db_mssql_password",
+                     "email_password"):
             val = cfg.get(key, "")
             if val:
                 cfg[key] = "..." + val[-4:]
             else:
                 cfg[key] = ""
+        # Computed field: DSGVO provider block active?
+        cfg["_dsgvo_provider_block"] = cfg.get("provider", "ollama") != "ollama"
         self._send_json({"config": cfg})
 
     def _handle_get_users(self):
@@ -4191,6 +4903,28 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                     "created_at": a.get("created_at"),
                 })
         self._send_json({"accounts": acct_list})
+
+    # --- Email endpoint handlers ---
+
+    def _handle_email_test(self):
+        """POST /api/email/test — Test IMAP connection."""
+        with config_lock:
+            server = config.get("email_imap_server", "")
+            port = config.get("email_imap_port", 993)
+            address = config.get("email_address", "")
+            password = config.get("email_password", "")
+        if not server or not address or not password:
+            self._send_json({"ok": False, "error": "Email server, address, and password are required"})
+            return
+        try:
+            conn = imaplib.IMAP4_SSL(server, port)
+            conn.login(address, password)
+            status, data = conn.select("INBOX", readonly=True)
+            msg_count = int(data[0]) if status == "OK" else 0
+            conn.logout()
+            self._send_json({"ok": True, "message": f"Connected! INBOX has {msg_count} messages."})
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)})
 
     # --- Database endpoint handlers ---
 
@@ -4263,14 +4997,28 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not filename:
                 filename = "upload.txt"
 
-            # Handle Excel files
-            if filename.lower().endswith((".xlsx", ".xls")):
+            # Parse file content based on extension
+            ext = os.path.splitext(filename.lower())[1]
+            if ext in (".xlsx", ".xls"):
                 if not HAS_OPENPYXL:
                     self._send_json({"error": "Excel support requires openpyxl. Run: pip install openpyxl"}, 400)
                     return
                 file_content = parse_excel(file_bytes)
-            else:
+            elif ext == ".pdf":
+                if not HAS_PYPDF2:
+                    self._send_json({"error": "PDF support requires PyPDF2. Run: pip install PyPDF2"}, 400)
+                    return
+                file_content = parse_pdf(file_bytes)
+            elif ext == ".docx":
+                if not HAS_DOCX:
+                    self._send_json({"error": "DOCX support requires python-docx. Run: pip install python-docx"}, 400)
+                    return
+                file_content = parse_docx(file_bytes)
+            elif ext in PLAIN_TEXT_EXTENSIONS:
                 file_content = file_bytes.decode("utf-8", errors="replace")
+            else:
+                self._send_json({"error": f"Unsupported file type: {ext}"}, 400)
+                return
 
             result = store_document(filename, file_content, session["username"])
             self._send_json({"ok": True, **result})
@@ -4361,6 +5109,7 @@ class MonitorHandler(SimpleHTTPRequestHandler):
 # Server
 # ---------------------------------------------------------------------------
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    address_family = socket.AF_INET  # Force IPv4 — fixes LAN access on Python 3.12+
     daemon_threads = True
     allow_reuse_address = True
 
