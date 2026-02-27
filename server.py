@@ -102,6 +102,7 @@ EVENTS_FILE = DATA_DIR / "events.jsonl"
 CONFIG_FILE = DATA_DIR / "config.json"
 USERS_FILE = DATA_DIR / "users.json"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 PUBLIC_DIR = Path(__file__).resolve().parent / "public"
 
 config = {
@@ -3249,6 +3250,110 @@ def update_document(doc_id: str, filename: str | None, content: str | None, user
 
 
 # ---------------------------------------------------------------------------
+# Knowledge folder auto-sync
+# ---------------------------------------------------------------------------
+_KNOWLEDGE_SYNC_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | frozenset((".xlsx", ".xls", ".pdf", ".docx"))
+
+
+def sync_knowledge_folder() -> dict:
+    """Scan KNOWLEDGE_DIR for new/changed files and index them into the RAG DB.
+
+    Tracks already-indexed files by filename + mtime in the documents table.
+    Files whose uploaded_by == '_knowledge_folder' are managed by this sync.
+    Deleted files are removed from the DB. Changed files are re-indexed.
+    Returns {"added": N, "updated": N, "deleted": N, "errors": [...]}.
+    """
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    result = {"added": 0, "updated": 0, "deleted": 0, "errors": [], "skipped": 0}
+
+    # Collect all eligible files in the knowledge folder (recursive)
+    folder_files = {}  # relative_path -> (abs_path, mtime)
+    for p in KNOWLEDGE_DIR.rglob("*"):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext not in _KNOWLEDGE_SYNC_EXTENSIONS:
+            continue
+        rel = str(p.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
+        folder_files[rel] = (p, p.stat().st_mtime)
+
+    # Get existing knowledge-folder documents from DB
+    conn = _get_embedding_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT id, filename, uploaded_at FROM documents WHERE uploaded_by = '_knowledge_folder'"
+        )
+        db_docs = {row[1]: {"id": row[0], "uploaded_at": row[2]} for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+    # Delete docs whose files no longer exist
+    for fname, info in db_docs.items():
+        if fname not in folder_files:
+            delete_document(info["id"])
+            result["deleted"] += 1
+            print(f"[knowledge] Deleted: {fname}")
+
+    # Add or update files
+    for rel_path, (abs_path, mtime) in folder_files.items():
+        existing = db_docs.get(rel_path)
+        if existing and existing["uploaded_at"] >= mtime:
+            result["skipped"] += 1
+            continue  # unchanged
+
+        try:
+            file_bytes = abs_path.read_bytes()
+            ext = abs_path.suffix.lower()
+
+            if ext in (".xlsx", ".xls"):
+                if not HAS_OPENPYXL:
+                    result["errors"].append(f"{rel_path}: openpyxl not installed")
+                    continue
+                content = parse_excel(file_bytes)
+            elif ext == ".pdf":
+                if not HAS_PYPDF2:
+                    result["errors"].append(f"{rel_path}: PyPDF2 not installed")
+                    continue
+                content = parse_pdf(file_bytes)
+            elif ext == ".docx":
+                if not HAS_DOCX:
+                    result["errors"].append(f"{rel_path}: python-docx not installed")
+                    continue
+                content = parse_docx(file_bytes)
+            elif ext in PLAIN_TEXT_EXTENSIONS:
+                content = file_bytes.decode("utf-8", errors="replace")
+            else:
+                continue
+
+            if not content.strip():
+                result["errors"].append(f"{rel_path}: empty content")
+                continue
+
+            if existing:
+                # Re-index: delete old, store new
+                delete_document(existing["id"])
+                store_document(rel_path, content, "_knowledge_folder")
+                result["updated"] += 1
+                print(f"[knowledge] Updated: {rel_path}")
+            else:
+                store_document(rel_path, content, "_knowledge_folder")
+                result["added"] += 1
+                print(f"[knowledge] Added: {rel_path}")
+
+        except Exception as e:
+            result["errors"].append(f"{rel_path}: {e}")
+            print(f"[knowledge] Error processing {rel_path}: {e}", file=sys.stderr)
+
+    total = result["added"] + result["updated"] + result["deleted"]
+    if total > 0:
+        print(f"[knowledge] Sync done: +{result['added']} ~{result['updated']} -{result['deleted']} ({result['skipped']} unchanged)")
+    else:
+        print(f"[knowledge] Sync done: {result['skipped']} files unchanged, nothing to do")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
 def compute_stats() -> dict:
@@ -3534,6 +3639,12 @@ class MonitorHandler(SimpleHTTPRequestHandler):
             if not session:
                 return
             return self._handle_embeddings_text(session)
+
+        if path == "/api/knowledge/sync":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_knowledge_sync()
 
         self._send_json({"error": "Not found"}, 404)
 
@@ -4630,6 +4741,12 @@ class MonitorHandler(SimpleHTTPRequestHandler):
                 return
             return self._handle_embeddings_stats()
 
+        if path == "/api/knowledge/files":
+            session = self._require_auth("admin")
+            if not session:
+                return
+            return self._handle_knowledge_files()
+
         # Static files (public)
         self._serve_static(path)
 
@@ -5104,6 +5221,45 @@ class MonitorHandler(SimpleHTTPRequestHandler):
         """GET /api/embeddings/stats — Total docs, chunks, DB size."""
         self._send_json(get_embedding_stats())
 
+    def _handle_knowledge_sync(self):
+        """POST /api/knowledge/sync — Scan knowledge/ folder and index new/changed files."""
+        try:
+            result = sync_knowledge_folder()
+            self._send_json({"ok": True, **result})
+        except Exception as e:
+            self._send_json({"error": f"Sync failed: {e}"}, 500)
+
+    def _handle_knowledge_files(self):
+        """GET /api/knowledge/files — List files in the knowledge/ folder."""
+        KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+        files = []
+        for p in sorted(KNOWLEDGE_DIR.rglob("*")):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+            if ext not in _KNOWLEDGE_SYNC_EXTENSIONS:
+                continue
+            rel = str(p.relative_to(KNOWLEDGE_DIR)).replace("\\", "/")
+            st = p.stat()
+            files.append({
+                "path": rel,
+                "size": st.st_size,
+                "modified": st.st_mtime,
+                "ext": ext,
+            })
+        # Check which are indexed
+        conn = _get_embedding_conn()
+        try:
+            cursor = conn.execute(
+                "SELECT filename FROM documents WHERE uploaded_by = '_knowledge_folder'"
+            )
+            indexed = {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+        for f in files:
+            f["indexed"] = f["path"] in indexed
+        self._send_json({"files": files, "folder": str(KNOWLEDGE_DIR)})
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -5127,10 +5283,14 @@ def main():
     rebuild_users_from_events()
     save_users()
     init_embedding_db()
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[chatbot-monitor] Loaded {len(events)} events, {len(users)} users, {len(accounts)} accounts")
     print(f"[chatbot-monitor] Ollama: {config['ollama_url']}  Model: {config['default_model']}")
     print(f"[chatbot-monitor] DB: type={config.get('db_type','none')} enabled={config.get('db_enabled',False)}")
     print(f"[chatbot-monitor] RAG: enabled={config.get('rag_enabled',False)} embeddings_db={EMBEDDINGS_DB}")
+    print(f"[chatbot-monitor] Knowledge folder: {KNOWLEDGE_DIR}")
+    # Sync knowledge folder on startup (background thread to not block boot)
+    threading.Thread(target=sync_knowledge_folder, daemon=True).start()
 
     server = ThreadedHTTPServer(("0.0.0.0", PORT), MonitorHandler)
     print(f"[chatbot-monitor] Dashboard: http://localhost:{PORT}/")

@@ -85,6 +85,9 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
 .dots span { width:6px; height:6px; border-radius:50%; background:var(--text-dim); animation:pulse 1.4s infinite both; }
 .dots span:nth-child(2) { animation-delay:.2s; } .dots span:nth-child(3) { animation-delay:.4s; }
 @keyframes pulse { 0%,80%,100%{opacity:.3;transform:scale(.8)} 40%{opacity:1;transform:scale(1)} }
+.drop-overlay { display:none;position:absolute;inset:0;background:rgba(88,166,255,.08);border:2px dashed var(--accent);border-radius:8px;z-index:50;align-items:center;justify-content:center;pointer-events:none; }
+.drop-overlay.active { display:flex; }
+.drop-overlay span { background:var(--surface);padding:8px 18px;border-radius:8px;font-size:13px;color:var(--accent);font-weight:600;border:1px solid var(--accent); }
 .stream-cursor { color:var(--accent); animation:blink 1s step-end infinite; }
 @keyframes blink { 50%{opacity:0} }
 
@@ -422,7 +425,8 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
         <button class="tab staff-only" data-t="sql" onclick="cTab('sql')">SQL <span class="tbadge hide" id="sqlBadge">0</span></button>
         <button class="tab admin-only" data-t="adminchat" onclick="cTab('adminchat')" id="adminChatTab" style="display:none">View Chat</button>
       </div>
-      <div id="tChat" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
+      <div id="tChat" style="display:flex;flex-direction:column;flex:1;overflow:hidden;position:relative">
+        <div class="drop-overlay" id="chatDropOverlay"><span>Datei hier ablegen</span></div>
         <div class="cmsg" id="chatMessages"><div class="cempty"><div>Ask the chatbot anything</div><div style="font-size:11px;opacity:.6">Messages go to your local Ollama</div></div></div>
         <div class="usage-bar" id="usageBar">
           <div class="ub-item"><span class="ub-label">Session:</span> <span class="ub-val accent" id="ubTotal">0</span> <span class="ub-label">tokens</span></div>
@@ -515,6 +519,19 @@ body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkM
               <button class="mbtn" onclick="uploadKbText()" style="font-size:11px;width:100%;margin-top:4px">Add Text</button>
             </div>
             <div id="kbUploadStatus" style="font-size:11px;margin-top:6px;min-height:16px"></div>
+          </div>
+
+          <div class="sc admin-only" style="padding:10px;margin-top:8px;border:1px solid rgba(88,166,255,.2);background:rgba(88,166,255,.04)">
+            <div class="sl" style="display:flex;align-items:center;gap:8px">
+              <span>Knowledge Folder</span>
+              <button class="mbtn" onclick="syncKnowledgeFolder()" id="btnKbSync" style="font-size:10px;padding:2px 10px">Sync Now</button>
+              <span id="kbSyncStatus" style="font-size:10px;color:var(--text-dim)"></span>
+            </div>
+            <div style="font-size:10px;color:var(--text-dim);margin:4px 0 6px">
+              Drop files into <code id="kbFolderPath" style="background:var(--surface2);padding:1px 4px;border-radius:3px">knowledge/</code> and click Sync to index them automatically.
+              <br>Supports: PDF, DOCX, XLSX, TXT, MD, CSV, JSON, XML, HTML, YAML, code files, and more.
+            </div>
+            <div id="kbFolderFiles" style="max-height:200px;overflow-y:auto"></div>
           </div>
 
           <div class="stitle">Documents</div>
@@ -810,6 +827,28 @@ function onChatFileSelected(input){
   }).catch(e=>{clearChatFile();alert('Upload Fehler: '+e.message)});
 }
 function clearChatFile(){chatFileData=null;$('chatFileInput').value='';$('chatFilePreview').style.display='none';$('chatFileName').textContent=''}
+
+// ---- Drag & drop file upload ----
+(function(){
+  const zone=$('tChat');if(!zone)return;
+  let dragCount=0;
+  const ov=$('chatDropOverlay');
+  zone.addEventListener('dragenter',e=>{e.preventDefault();dragCount++;ov.classList.add('active')});
+  zone.addEventListener('dragleave',e=>{e.preventDefault();dragCount--;if(dragCount<=0){dragCount=0;ov.classList.remove('active')}});
+  zone.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='copy'});
+  zone.addEventListener('drop',e=>{
+    e.preventDefault();dragCount=0;ov.classList.remove('active');
+    const files=e.dataTransfer.files;if(!files?.length)return;
+    const file=files[0];
+    const fd=new FormData();fd.append('file',file);
+    $('chatFileName').textContent='Lade: '+file.name+'...';
+    $('chatFilePreview').style.display='flex';
+    fetch('/api/chat/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+      if(d.ok){chatFileData={filename:d.filename,content:d.content};$('chatFileName').textContent='\u{1F4CE} '+d.filename+(d.truncated?' (gek\u00FCrzt)':'');$('chatFilePreview').style.display='flex'}
+      else{clearChatFile();alert('Fehler: '+(d.error||'Upload fehlgeschlagen'))}
+    }).catch(err=>{clearChatFile();alert('Upload Fehler: '+err.message)});
+  });
+})();
 
 // ---- Token usage tracking ----
 let sessionUsage={prompt_tokens:0,completion_tokens:0,total_tokens:0,requests:0};
@@ -1694,7 +1733,42 @@ async function runSqlQuery(){
 
 // ---- Knowledge Base ----
 async function loadKnowledge(){
-  await Promise.all([loadKbDocs(),loadKbStats()]);
+  await Promise.all([loadKbDocs(),loadKbStats(),loadKbFolderFiles()]);
+}
+
+async function loadKbFolderFiles(){
+  try{
+    const r=await fetch('/api/knowledge/files');if(!r.ok)return;
+    const d=await r.json();
+    const fp=$('kbFolderPath');if(fp)fp.textContent=d.folder||'knowledge/';
+    const el=$('kbFolderFiles');if(!el)return;
+    if(!d.files?.length){el.innerHTML='<div style="font-size:10px;color:var(--text-dim);padding:4px">No files in folder yet. Drop files into the knowledge/ folder.</div>';return}
+    el.innerHTML=d.files.map(f=>{
+      const sz=f.size<1024?(f.size+'B'):f.size<1048576?((f.size/1024).toFixed(1)+'KB'):((f.size/1048576).toFixed(1)+'MB');
+      const dot=f.indexed?'<span style="color:var(--green)" title="Indexed">&#9679;</span>':'<span style="color:var(--orange)" title="Not indexed">&#9675;</span>';
+      return`<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px;border-bottom:1px solid rgba(48,54,61,.5)">${dot}<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.path)}">${esc(f.path)}</span><span style="color:var(--text-dim);font-size:10px;white-space:nowrap">${sz}</span></div>`;
+    }).join('');
+  }catch(e){}
+}
+
+async function syncKnowledgeFolder(){
+  const btn=$('btnKbSync');const st=$('kbSyncStatus');
+  btn.disabled=true;st.textContent='Syncing...';st.style.color='var(--text-dim)';
+  try{
+    const r=await fetch('/api/knowledge/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(d.ok){
+      const parts=[];
+      if(d.added)parts.push('+'+d.added+' added');
+      if(d.updated)parts.push('~'+d.updated+' updated');
+      if(d.deleted)parts.push('-'+d.deleted+' deleted');
+      if(d.errors?.length)parts.push(d.errors.length+' errors');
+      if(!parts.length)parts.push('Up to date');
+      st.textContent=parts.join(', ');st.style.color='var(--green)';
+      loadKnowledge();
+    }else{st.textContent='Error: '+(d.error||'Unknown');st.style.color='var(--red)'}
+  }catch(e){st.textContent='Failed: '+e.message;st.style.color='var(--red)'}
+  btn.disabled=false;
 }
 let _kbViewingDoc=null; // currently expanded doc id
 async function loadKbDocs(){

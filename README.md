@@ -65,7 +65,18 @@ The server is optimized for production use:
 
 ## Quick Start
 
-### 1. Start the monitor server
+### Option A: One-Click (Windows)
+
+Double-click **`START.bat`** — it handles everything:
+1. Requests admin rights (for firewall/network)
+2. Opens firewall port 7779 for LAN access
+3. Starts Ollama if not running
+4. Downloads the embedding model (`nomic-embed-text`) if missing
+5. Installs missing Python packages (`openpyxl`, `PyPDF2`, `numpy`, `tiktoken`)
+6. Creates the `knowledge/` folder
+7. Starts the server and opens the browser
+
+### Option B: Manual
 
 ```bash
 python chatbot-monitor/server.py
@@ -79,13 +90,15 @@ On first startup, a default admin account is created:
 
 Change this password or create a new admin account after first login.
 
-### 2. Optional dependencies
+### Optional dependencies
 
 ```bash
 pip install pyodbc      # For MSSQL database connections
 pip install openpyxl    # For Excel file uploads (.xlsx)
 pip install PyPDF2      # For PDF file uploads (.pdf)
 pip install python-docx # For DOCX file uploads (.docx)
+pip install numpy       # For RAG cosine similarity search
+pip install tiktoken    # For accurate token counting
 ```
 
 All are optional — the server runs without them but the respective features will be unavailable.
@@ -273,13 +286,28 @@ Upload documents that get chunked, embedded, and used as context for all convers
 | `.py`, `.js`, `.ts`, `.java`, `.cs`, `.cpp`, `.c`, `.h`, `.sh`, `.bat`, `.ps1` | Source code |
 | `.ini`, `.cfg`, `.properties`, `.toml`, `.sql`, `.log` | Config/log files |
 
-### How It Works
+### Knowledge Folder (Auto-Sync)
+
+Drop files into the `knowledge/` folder and they get automatically indexed:
+
+1. Place files in `chatbot-monitor/knowledge/` (supports subdirectories)
+2. Go to **Knowledge** tab → click **Sync Now** (or restart the server — it syncs on startup)
+3. New and changed files are parsed, chunked, and embedded automatically
+4. Deleted files are removed from the database
+
+The sync tracks files by name and modification time — unchanged files are skipped. Files indexed from the folder are tagged with `_knowledge_folder` as uploader and appear alongside manually uploaded documents.
+
+### Manual Upload
 
 1. Upload a document via the Knowledge tab (admin/mitarbeiter)
-2. Text is split into chunks (~500 tokens each)
-3. Each chunk is embedded using OpenAI or Ollama embeddings
-4. When a user chats, the question is embedded and matched against stored chunks via cosine similarity
-5. Top-K relevant chunks are injected into the system prompt as context
+2. Or paste text directly with a title
+
+### How It Works
+
+1. Text is split into chunks (~500 tokens each)
+2. Each chunk is embedded using OpenAI or Ollama embeddings
+3. When a user chats, the question is embedded and matched against stored chunks via cosine similarity
+4. Top-K relevant chunks are injected into the system prompt as context
 
 ### Excel Support
 
@@ -559,6 +587,8 @@ Right panel tabs: **Users | Stats | Accounts | Knowledge**
 | POST | `/api/accounts/<name>/role` | Change account role |
 | POST | `/api/accounts/<name>/priority` | Change account priority |
 | POST | `/api/accounts/<name>/delete` | Delete a dashboard account |
+| POST | `/api/knowledge/sync` | Scan knowledge/ folder and index new/changed files |
+| GET | `/api/knowledge/files` | List files in the knowledge/ folder with index status |
 | POST | `/api/email/test` | Test IMAP email connection |
 | POST | `/api/db/test` | Test database connection |
 | GET | `/api/db/schema` | Get database schema |
@@ -640,6 +670,7 @@ All data stored in `data/` directory (git-ignored):
 | `data/users.json` | Chatbot end-user profiles |
 | `data/accounts.json` | Dashboard account credentials |
 | `data/embeddings.db` | Knowledge base vectors (SQLite) |
+| `knowledge/` | Drop files here for auto-indexing into the knowledge base |
 
 ## Testing
 
@@ -661,3 +692,5 @@ The test suite covers 221 tests across authentication, role-based access, event 
 | `monitor.py` | Python SDK: fire-and-forget logging, wrappers, middleware |
 | `public/index.html` | Dashboard UI: login, chat, feed, stats, admin panels, knowledge base |
 | `test_all.py` | Comprehensive test suite (221 tests) |
+| `START.bat` | One-click startup: Ollama, embedding model, pip packages, firewall, server |
+| `knowledge/` | Drop files here for automatic RAG indexing |
